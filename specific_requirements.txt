@@ -18,3 +18,5 @@ pydantic-core==2.33.2
 huggingface_hub==0.34.4
 numba==0.61.2
 triton==3.3.0
+mamba-ssm
+causal-conv1d
