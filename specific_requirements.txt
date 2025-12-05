@@ -1,5 +1,4 @@
 torch==2.7.0+cu126
-adam-atan2==0.0.3
 einops==0.8.1
 tqdm==4.67.1
 coolname==2.2.0
