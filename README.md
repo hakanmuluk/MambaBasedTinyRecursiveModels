@@ -108,7 +108,7 @@ arch=trm \
 data_paths="[data/sudoku-extreme-1k-aug-1000]" \
 data_paths_test="[]" \
 evaluators="[]" \
-global_batch_size=512 \
+global_batch_size=384 \
 epochs=35000 eval_interval=5000 \
 lr=1e-4 lr_min_ratio=0.05 lr_warmup_steps=2000 \
 puzzle_emb_lr=1e-2 \
