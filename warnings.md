@@ -59,6 +59,8 @@ pip install torch==2.7.0+cu126 torchvision torchaudio \
 
 ```bash
 pip install -r specific_requirements.txt
+pip install --no-cache-dir --no-build-isolation adam-atan2
+
 ```
 
 ### (Optional) Login to W&B once
