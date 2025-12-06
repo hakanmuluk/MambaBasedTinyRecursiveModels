@@ -47,10 +47,12 @@ source .venv/bin/activate
 pip install --upgrade pip wheel setuptools
 ```
 
-### Install PyTorch 2.8.0 (CUDA 12.6 wheels)
+### Install PyTorch 2.7.0 (CUDA 12.6 wheels)
 
 ```bash
-pip install --pre --upgrade torch torchvision torchaudio   --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.7.0+cu126 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu126
+
 ```
 
 ### Install project dependencies
