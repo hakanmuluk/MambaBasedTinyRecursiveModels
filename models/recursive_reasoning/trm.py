@@ -81,22 +81,10 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mamba_expand: float = 2.0
     mamba_dt_rank: str = "auto"  # passed directly to Mamba (e.g. "auto")
 
+    mamba_two_stage: bool = False
+
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
-    """
-    One reasoning block.
-
-    - If mlp_t == True: uses a SwiGLU MLP over the *sequence dimension* (original TRM mlp_t mode).
-    - Else: uses a bidirectional Mamba block over hidden_size, then a SwiGLU MLP over hidden_size.
-
-    Bidirectional Mamba:
-      y_fwd = Mamba(x)
-      y_bwd = reverse(Mamba(reverse(x)))
-      y = 0.5 * (y_fwd + y_bwd)
-      hidden = RMSNorm(x + y)
-      hidden = RMSNorm(hidden + MLP(hidden))
-    """
-
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
 
@@ -116,9 +104,53 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 expansion=config.expansion,
             )
             self.mamba = None
-        else:
+            self.mamba_first = None
+            self.mamba_second = None
+        elif self.config.mamba_two_stage:
+            # 🔹 Two-stage bi-Mamba with separate fwd/bwd nets
             self.mlp_t = None
-            # 🔹 Mamba over hidden_size, with the same internal size as your earlier setup
+
+            # First Mamba layer
+            self.mamba_first = Mamba(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                layer_idx=None,
+                device=None,
+                dtype=self.forward_dtype,
+            )
+            # Direction-specific networks after first Mamba
+            self.dir_fwd = SwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
+            self.dir_bwd = SwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
+
+            # Second Mamba layer
+            self.mamba_second = Mamba(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                layer_idx=None,
+                device=None,
+                dtype=self.forward_dtype,
+            )
+            self.mamba = None
+        else:
+            # 🔹 Simple bidirectional Mamba over hidden_size (existing behavior)
+            self.mlp_t = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+
             self.mamba = Mamba(
                 d_model=config.hidden_size,
                 d_state=config.mamba_d_state,
@@ -136,6 +168,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             expansion=config.expansion,
         )
 
+
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # B, L, D = hidden_states.shape
 
@@ -145,8 +178,44 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             out = self.mlp_t(hidden_states)
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
             hidden_states = hidden_states.transpose(1, 2)  # back to [B, L, D]
+
+        elif self.config.mamba_two_stage:
+            # 🔹 Two-stage bi-Mamba with directional networks
+
+            x = hidden_states.contiguous()
+
+            # ----- Stage 1 -----
+            # Bi-Mamba (first layer)
+            y1_fwd = self.mamba_first(x)
+
+            rev_x = torch.flip(x, dims=[1])
+            y1_bwd = self.mamba_first(rev_x)
+            y1_bwd = torch.flip(y1_bwd, dims=[1])
+
+            # Direction-specific networks
+            y1_fwd = self.dir_fwd(y1_fwd)
+            y1_bwd = self.dir_bwd(y1_bwd)
+
+            # Sum fwd + bwd branches
+            y1 = y1_fwd + y1_bwd      # if you prefer, you can scale: 0.5 * (y1_fwd + y1_bwd)
+
+            # Residual + norm
+            x = rms_norm(x + y1, variance_epsilon=self.norm_eps)
+
+            # ----- Stage 2 -----
+            y2_fwd = self.mamba_second(x)
+
+            rev_x2 = torch.flip(x, dims=[1])
+            y2_bwd = self.mamba_second(rev_x2)
+            y2_bwd = torch.flip(y2_bwd, dims=[1])
+
+            # Sum second-layer bi-Mamba outputs
+            y2 = y2_fwd + y2_bwd      # again, could be 0.5 * (...) if you want to keep scale
+
+            hidden_states = rms_norm(x + y2, variance_epsilon=self.norm_eps)
+
         else:
-            # 🔹 Bidirectional Mamba over [B, L, D]
+            # 🔹 Original simple bidirectional Mamba
             hidden_states = hidden_states.contiguous()
 
             # Forward pass
@@ -163,11 +232,12 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             # Residual + RMSNorm
             hidden_states = rms_norm(hidden_states + y, variance_epsilon=self.norm_eps)
 
-        # Fully Connected MLP over hidden_size
+        # Final MLP over hidden_size (shared for all modes)
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
 
         return hidden_states
+
 
 
 class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
