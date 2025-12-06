@@ -101,15 +101,15 @@ arch.L_layers=2 \
 arch.H_cycles=3 arch.L_cycles=6 \
 +run_name=${run_name} ema=True
 
-run_name="pretrain_mamba_sudoku_two_nns"
+run_name="pretrain_mamba_sudoku_two_nns2"
 
 python pretrain.py \
 arch=trm \
 data_paths="[data/sudoku-extreme-1k-aug-1000]" \
 data_paths_test="[]" \
 evaluators="[]" \
-global_batch_size=384 \
-epochs=35000 eval_interval=5000 \
+global_batch_size=256 \
+epochs=20000 eval_interval=5000 \
 lr=1e-4 lr_min_ratio=0.05 lr_warmup_steps=2000 \
 puzzle_emb_lr=1e-2 \
 weight_decay=0.1 puzzle_emb_weight_decay=0.1 \
