@@ -3,6 +3,7 @@ import os
 import csv
 import json
 import numpy as np
+import random 
 
 from argdantic import ArgParser
 from pydantic import BaseModel
@@ -11,6 +12,15 @@ from huggingface_hub import hf_hub_download
 
 from common import PuzzleDatasetMetadata
 
+"""
+python dataset/build_sudoku_dataset.py \
+--output-dir data/sudoku-extreme-1k-aug-1000 \
+--subsample-size 1000 \
+--test-subsample-size 20000 \
+--num-aug 1000 \
+--seed 42
+
+"""
 
 cli = ArgParser()
 
@@ -19,9 +29,13 @@ class DataProcessConfig(BaseModel):
     source_repo: str = "sapientinc/sudoku-extreme"
     output_dir: str = "data/sudoku-extreme-full"
 
-    subsample_size: Optional[int] = None
+    subsample_size: Optional[int] = None        # for train
+    test_subsample_size: Optional[int] = None   # NEW: for test
+
     min_difficulty: Optional[int] = None
     num_aug: int = 0
+
+    seed: Optional[int] = 42
 
 
 def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
@@ -74,12 +88,24 @@ def convert_subset(set_name: str, config: DataProcessConfig):
 
     # If subsample_size is specified for the training set,
     # randomly sample the desired number of examples.
+    # If subsample_size is specified for the training set,
+    # randomly sample the desired number of examples.
     if set_name == "train" and config.subsample_size is not None:
         total_samples = len(inputs)
         if config.subsample_size < total_samples:
             indices = np.random.choice(total_samples, size=config.subsample_size, replace=False)
             inputs = [inputs[i] for i in indices]
             labels = [labels[i] for i in indices]
+
+    # If test_subsample_size is specified for the test set,
+    # randomly sample the desired number of test examples.
+    if set_name == "test" and config.test_subsample_size is not None:
+        total_samples = len(inputs)
+        if config.test_subsample_size < total_samples:
+            indices = np.random.choice(total_samples, size=config.test_subsample_size, replace=False)
+            inputs = [inputs[i] for i in indices]
+            labels = [labels[i] for i in indices]
+
 
     # Generate dataset
     num_augments = config.num_aug if set_name == "train" else 0
@@ -159,6 +185,9 @@ def convert_subset(set_name: str, config: DataProcessConfig):
 
 @cli.command(singleton=True)
 def preprocess_data(config: DataProcessConfig):
+    if config.seed is not None:
+        np.random.seed(config.seed)
+        random.seed(config.seed)
     convert_subset("train", config)
     convert_subset("test", config)
 
