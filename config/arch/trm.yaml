@@ -30,3 +30,5 @@ mamba_d_state: 64
 mamba_d_conv: 4
 mamba_expand: 2.0
 mamba_dt_rank: auto
+
+mamba_two_stage: True  # 🔹 enable your new 2-layer Mamba mode
