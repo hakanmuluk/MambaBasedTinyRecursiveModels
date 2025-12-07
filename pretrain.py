@@ -76,12 +76,13 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
-    min_eval_interval: Optional[int] = 0 # when to start eval
+    min_eval_interval: Optional[int] = 0  # when to start eval
     eval_save_outputs: List[str] = []
 
-    ema: bool = False # use Exponential-Moving-Average
-    ema_rate: float = 0.999 # EMA-rate
-    freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    ema: bool = False  # use Exponential-Moving-Average
+    ema_rate: float = 0.999  # EMA-rate
+    freeze_weights: bool = False  # If True, freeze weights and only learn the embeddings
+
 
 @dataclass
 class TrainState:
@@ -95,22 +96,44 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    dataset = PuzzleDataset(PuzzleDatasetConfig(
-        seed=config.seed,
-        dataset_paths=config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths,
-        rank=rank,
-        num_replicas=world_size,
-        **kwargs
-    ), split=split)
+    dataset = PuzzleDataset(
+        PuzzleDatasetConfig(
+            seed=config.seed,
+            dataset_paths=config.data_paths_test if len(config.data_paths_test) > 0 and split == "test" else config.data_paths,
+            rank=rank,
+            num_replicas=world_size,
+            **kwargs,
+        ),
+        split=split,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=None,
         num_workers=1,
         prefetch_factor=8,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True,
     )
     return dataloader, dataset.metadata
+
+
+# ---------------------------------------------------------
+# Helper: split parameters into decay / no-decay groups
+# based on the `_no_weight_decay` flag.
+# ---------------------------------------------------------
+def split_weight_decay_groups(model: nn.Module):
+    decay_params: List[nn.Parameter] = []
+    no_decay_params: List[nn.Parameter] = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if getattr(p, "_no_weight_decay", False):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
+
+    return decay_params, no_decay_params
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
@@ -120,7 +143,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
+        causal=False,  # Non-autoregressive
     )
 
     # Instantiate model with loss head
@@ -144,52 +167,86 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers and lr
+    # -----------------------------------------------------
+    # Build optimizer(s) with proper weight-decay handling
+    # -----------------------------------------------------
+    decay_params, no_decay_params = split_weight_decay_groups(model)
+
+    optimizers: List[torch.optim.Optimizer] = []
+    optimizer_lrs: List[float] = []
+
     if config.arch.puzzle_emb_ndim == 0:
-        optimizers = [
-            AdamATan2(
-                model.parameters(),
-                lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
+        # No puzzle embedding: only AdamATan2 on the model
+        if len(decay_params):
+            optimizers.append(
+                AdamATan2(
+                    decay_params,
+                    lr=0,  # will be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2),
+                )
             )
-        ]
-        optimizer_lrs = [
-            config.lr
-        ]
+            optimizer_lrs.append(config.lr)
+
+        if len(no_decay_params):
+            optimizers.append(
+                AdamATan2(
+                    no_decay_params,
+                    lr=0,  # will be set by scheduler
+                    weight_decay=0.0,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(config.lr)
+
     elif config.freeze_weights:
-        optimizers = [
+        # Only learn puzzle embeddings; freeze the rest
+        optimizers.append(
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
+                lr=0,  # will be set by scheduler
                 weight_decay=config.puzzle_emb_weight_decay,
-                world_size=world_size
+                world_size=world_size,
             )
-        ]
-        optimizer_lrs = [
-            config.puzzle_emb_lr
-        ]
+        )
+        optimizer_lrs.append(config.puzzle_emb_lr)
+
     else:
-        optimizers = [
+        # Learn puzzle embeddings + model (with split decay/no-decay)
+        optimizers.append(
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
+                lr=0,  # will be set by scheduler
                 weight_decay=config.puzzle_emb_weight_decay,
-                world_size=world_size
-            ),
-            AdamATan2(
-                model.parameters(),
-                lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
+                world_size=world_size,
             )
-        ]
-        optimizer_lrs = [
-            config.puzzle_emb_lr,
-            config.lr
-        ]
+        )
+        optimizer_lrs.append(config.puzzle_emb_lr)
+
+        if len(decay_params):
+            optimizers.append(
+                AdamATan2(
+                    decay_params,
+                    lr=0,  # will be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(config.lr)
+
+        if len(no_decay_params):
+            optimizers.append(
+                AdamATan2(
+                    no_decay_params,
+                    lr=0,  # will be set by scheduler
+                    weight_decay=0.0,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(config.lr)
 
     return model, optimizers, optimizer_lrs
+
 
 def mix_weights_direct(device, alpha, net, nets):
     sd = []
@@ -197,26 +254,38 @@ def mix_weights_direct(device, alpha, net, nets):
         sd += [nets[i].state_dict()]
     sd_alpha = {}
     for k in sd[0].keys():
-        comb_net = alpha[0]*sd[0][k].to(device)
-        for i in range(1,len(nets)):
-            comb_net += alpha[i]*sd[i][k].to(device)
-        sd_alpha[k] =  comb_net
+        comb_net = alpha[0] * sd[0][k].to(device)
+        for i in range(1, len(nets)):
+            comb_net += alpha[i] * sd[i][k].to(device)
+        sd_alpha[k] = comb_net
     net.load_state_dict(sd_alpha)
     return net
 
+
 def cosine_schedule_with_warmup_lr_lambda(
-    current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
+    current_step: int,
+    *,
+    base_lr: float,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_ratio: float = 0.0,
+    num_cycles: float = 0.5,
 ):
     if current_step < num_warmup_steps:
         return base_lr * float(current_step) / float(max(1, num_warmup_steps))
 
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
+    return base_lr * (
+        min_ratio
+        + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    )
 
 
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     # Estimated total training steps
-    total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
+    total_steps = int(
+        config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size
+    )
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
@@ -224,11 +293,10 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     return TrainState(
         step=0,
         total_steps=total_steps,
-
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
     )
 
 
@@ -254,7 +322,10 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         if puzzle_emb_name in state_dict:
             puzzle_emb = state_dict[puzzle_emb_name]
             if puzzle_emb.shape != expected_shape:
-                print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
+                print(
+                    f"Resetting puzzle embedding as shape is different. "
+                    f"Found {puzzle_emb.shape}, Expected {expected_shape}"
+                )
                 # Re-initialize using mean
                 state_dict[puzzle_emb_name] = (
                     torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
@@ -268,13 +339,12 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         base_lr=base_lr,
         num_warmup_steps=round(config.lr_warmup_steps),
         num_training_steps=train_state.total_steps,
-        min_ratio=config.lr_min_ratio
+        min_ratio=config.lr_min_ratio,
     )
 
 
-
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
-    data_paths =config.data_paths_test if len(config.data_paths_test)>0 else config.data_paths
+    data_paths = config.data_paths_test if len(config.data_paths_test) > 0 else config.data_paths
     # Initialize evaluators
     evaluators = []
     for cfg in config.evaluators:
@@ -286,7 +356,15 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+
+def train_batch(
+    config: PretrainConfig,
+    train_state: TrainState,
+    batch: Any,
+    global_batch_size: int,
+    rank: int,
+    world_size: int,
+):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
@@ -300,7 +378,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    train_state.carry, loss, metrics, _, _ = train_state.model(
+        carry=train_state.carry, batch=batch, return_keys=[]
+    )
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -309,15 +389,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
-            
+
     # Apply optimizer
-    lr_this_step = None    
+    lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
         for param_group in optim.param_groups:
-            param_group['lr'] = lr_this_step
-            
+            param_group["lr"] = lr_this_step
+
         optim.step()
         optim.zero_grad()
 
@@ -334,13 +414,17 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
-            
+
             # Postprocess
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
-            reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
+            reduced_metrics = {
+                f"train/{k}": v / (global_batch_size if k.endswith("loss") else count)
+                for k, v in reduced_metrics.items()
+            }
 
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
+
 
 def evaluate(
     config: PretrainConfig,
@@ -370,12 +454,12 @@ def evaluate(
 
         carry = None
         processed_batches = 0
-        
+
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
-            
+
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
@@ -410,9 +494,7 @@ def evaluate(
             set_id = set_ids[set_name]
 
             if metric_values is None:
-                metric_keys = list(
-                    sorted(metrics.keys())
-                )  # Sort keys to guarantee all processes use the same order.
+                metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros(
                     (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
                 )
@@ -429,7 +511,8 @@ def evaluate(
             # Each rank save predictions independently
             os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
             torch.save(
-                save_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}")
+                save_preds,
+                os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}"),
             )
 
         del save_preds
@@ -457,11 +540,11 @@ def evaluate(
         # Run evaluators
         if rank == 0:
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
-            
+
         for i, evaluator in enumerate(evaluators):
             if rank == 0:
                 print(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
-                
+
             # Path for saving
             evaluator_save_path = None
             if config.checkpoint_path is not None:
@@ -472,18 +555,21 @@ def evaluate(
                 os.makedirs(evaluator_save_path, exist_ok=True)
 
             # Run and log
-            metrics = evaluator.result(evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group)
+            metrics = evaluator.result(
+                evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group
+            )
             if rank == 0 and metrics is not None:
                 if reduced_metrics is None:
                     reduced_metrics = {}
 
                 reduced_metrics.update(metrics)
                 print(f"  Completed {evaluator.__class__.__name__}")
-                
+
         if rank == 0:
             print("All evaluators completed!")
 
     return reduced_metrics
+
 
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
@@ -494,7 +580,7 @@ def save_code_and_config(config: PretrainConfig):
     # Copy code
     code_list = [
         get_model_source_path(config.arch.name),
-        get_model_source_path(config.arch.loss.name)
+        get_model_source_path(config.arch.loss.name),
     ]
     for code_file in code_list:
         if code_file is not None:
@@ -547,11 +633,12 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
+
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
         assert (
-            dist.get_rank(CPU_PROCESS_GROUP) == RANK and dist.get_world_size(CPU_PROCESS_GROUP) == WORLD_SIZE
+            dist.get_rank(CPU_PROCESS_GROUP) == RANK
+            and dist.get_world_size(CPU_PROCESS_GROUP) == WORLD_SIZE
         )
 
     # Load sync'ed config
@@ -566,16 +653,32 @@ def launch(hydra_config: DictConfig):
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    train_loader, train_metadata = create_dataloader(
+        config,
+        "train",
+        test_set_mode=False,
+        epochs_per_iter=train_epochs_per_iter,
+        global_batch_size=config.global_batch_size,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+    )
     try:
-        eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except:
+        eval_loader, eval_metadata = create_dataloader(
+            config,
+            "test",
+            test_set_mode=True,
+            epochs_per_iter=1,
+            global_batch_size=config.global_batch_size,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
+    except Exception:
         print("NO EVAL DATA FOUND")
         eval_loader = eval_metadata = None
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except:
+    except Exception:
         print("No evaluator found")
         evaluators = []
 
@@ -587,24 +690,36 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        wandb.init(
+            project=config.project_name,
+            name=config.run_name,
+            config=config.model_dump(),
+            settings=wandb.Settings(_disable_stats=True),
+        )  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:
-        print('Setup EMA')
+        print("Setup EMA")
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
     # Training Loop
     for _iter_id in range(total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+        print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
         if RANK == 0:
             print("TRAIN")
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            metrics = train_batch(
+                config,
+                train_state,
+                batch,
+                global_batch_size,
+                rank=RANK,
+                world_size=WORLD_SIZE,
+            )
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
@@ -623,18 +738,20 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
+            metrics = evaluate(
+                config,
+                train_state_eval,
+                eval_loader,
+                eval_metadata,
                 evaluators,
-                rank=RANK, 
+                rank=RANK,
                 world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
+                cpu_group=CPU_PROCESS_GROUP,
+            )
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
-                
+
             ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
