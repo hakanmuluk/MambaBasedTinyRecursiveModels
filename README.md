@@ -118,7 +118,7 @@ arch.H_cycles=3 arch.L_cycles=6 \
 +run_name=${run_name} \
 ema=True
 
-run_name="pretrain_mamba_sudoku_two_nns2"
+run_name="pretrain_bimamba_sudoku"
 
 python pretrain.py \
 arch=trm \
