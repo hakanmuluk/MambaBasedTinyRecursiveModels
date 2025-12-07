@@ -5,7 +5,8 @@ import torch
 import copy
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn_no_out_proj
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+
 
 from torch import nn
 from pydantic import BaseModel
@@ -92,11 +93,11 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
 class BiMambaV2(nn.Module):
     """
-    Bi-directional Mamba v2 block implemented using mamba-ssm fused kernels,
-    similar to Vision Mamba's bimamba_type == 'v2'.
+    Bi-directional Mamba v2 block implemented with PyTorch ops + selective_scan_fn
+    (no dependency on causal_conv1d_cuda).
 
     Input:  hidden_states (B, L, D)
-    Output: same shape (B, L, D)
+    Output: hidden_states (B, L, D)
     """
     def __init__(
         self,
@@ -112,7 +113,6 @@ class BiMambaV2(nn.Module):
         dt_init_floor: float = 1e-4,
         conv_bias: bool = True,
         bias: bool = False,
-        use_fast_path: bool = True,
         device=None,
         dtype=None,
         if_divide_out: bool = True,
@@ -127,25 +127,16 @@ class BiMambaV2(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
         self.if_divide_out = if_divide_out
-
-        self.dt_min = dt_min
-        self.dt_max = dt_max
-        self.dt_init = dt_init
-        self.dt_scale = dt_scale
-        self.dt_init_floor = dt_init_floor
 
         self.init_layer_scale = init_layer_scale
         if init_layer_scale is not None:
-            self.gamma = nn.Parameter(init_layer_scale * torch.ones((d_model)), requires_grad=True)
+            self.gamma = nn.Parameter(init_layer_scale * torch.ones((d_model), **factory_kwargs))
 
-        # ------------------------------------------------------------------
-        # In-projection: [B, L, D] → [B, 2 * d_inner, L]
-        # ------------------------------------------------------------------
+        # In-projection: [B, L, D] -> [B, L, 2 * d_inner]
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
-        # Depthwise conv along sequence (forward branch)
+        # Depthwise convs (forward & backward)
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -155,69 +146,6 @@ class BiMambaV2(nn.Module):
             padding=d_conv - 1,
             **factory_kwargs,
         )
-
-        self.activation = "silu"  # used inside fused kernel
-
-        # x_proj produces dt, B, C  (forward branch)
-        self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
-
-        # ------------------------------------------------------------------
-        # Initialize forward dt_proj (same logic as Vision Mamba)
-        # ------------------------------------------------------------------
-        dt_init_std = self.dt_rank**-0.5 * self.dt_scale
-        if self.dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif self.dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError(f"dt_init='{self.dt_init}' not supported")
-
-        dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs)
-            * (math.log(self.dt_max) - math.log(self.dt_min))
-            + math.log(self.dt_min)
-        ).clamp(min=self.dt_init_floor)
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
-        # do not reinit; do not decay
-        self.dt_proj.bias._no_reinit = True
-        self.dt_proj.bias._no_weight_decay = True
-
-        # ------------------------------------------------------------------
-        # S4D A matrices (forward and backward)
-        # ------------------------------------------------------------------
-        A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
-            "n -> d n",
-            d=self.d_inner,
-        ).contiguous()
-        A_log = torch.log(A)
-        self.A_log = nn.Parameter(A_log)
-        self.A_log._no_weight_decay = True
-
-        A_b = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
-            "n -> d n",
-            d=self.d_inner,
-        ).contiguous()
-        A_b_log = torch.log(A_b)
-        self.A_b_log = nn.Parameter(A_b_log)
-        self.A_b_log._no_weight_decay = True
-
-        # D "skip" params (forward & backward) – no weight decay
-        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
-        self.D._no_weight_decay = True
-
-        self.D_b = nn.Parameter(torch.ones(self.d_inner, device=device))
-        self.D_b._no_weight_decay = True
-
-        # ------------------------------------------------------------------
-        # Backward conv + projections (separate from forward)
-        # ------------------------------------------------------------------
         self.conv1d_b = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -228,99 +156,175 @@ class BiMambaV2(nn.Module):
             **factory_kwargs,
         )
 
+        self.activation = "silu"
+        self.act = nn.SiLU()
+
+        # Projections for dt, B, C (forward)
+        self.x_proj = nn.Linear(
+            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+        )
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        # Projections for dt, B, C (backward)
         self.x_proj_b = nn.Linear(
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
         self.dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
-        # --- dt_proj_b initialization (same as forward dt_proj) ---
-        if self.dt_init == "constant":
+        # Initialize dt_proj like Vision Mamba
+        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
             nn.init.constant_(self.dt_proj_b.weight, dt_init_std)
-        elif self.dt_init == "random":
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
             nn.init.uniform_(self.dt_proj_b.weight, -dt_init_std, dt_init_std)
         else:
-            raise NotImplementedError(f"dt_init='{self.dt_init}' not supported")
+            raise NotImplementedError
 
-        dt_b = torch.exp(
+        # Bias init so softplus(dt_bias) ∈ [dt_min, dt_max]
+        dt = torch.exp(
             torch.rand(self.d_inner, **factory_kwargs)
-            * (math.log(self.dt_max) - math.log(self.dt_min))
-            + math.log(self.dt_min)
-        ).clamp(min=self.dt_init_floor)
-        inv_dt_b = dt_b + torch.log(-torch.expm1(-dt_b))
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
-            self.dt_proj_b.bias.copy_(inv_dt_b)
-        # do not reinit; do not decay
+            self.dt_proj.bias.copy_(inv_dt)
+            self.dt_proj_b.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
         self.dt_proj_b.bias._no_reinit = True
+
+        self.dt_proj.bias._no_weight_decay = True
         self.dt_proj_b.bias._no_weight_decay = True
 
-        # ------------------------------------------------------------------
-        # Final out projection from d_inner back to d_model
-        # ------------------------------------------------------------------
+        # S4D A matrices (forward & backward)
+        A = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        A_b = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        self.A_b_log = nn.Parameter(torch.log(A_b))
+        self.A_b_log._no_weight_decay = True
+
+        # D (skip) parameters
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D._no_weight_decay = True
+        self.D_b = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D_b._no_weight_decay = True
+
+        # Final output projection
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
+    def _ssm_pass(
+        self,
+        x_conv: torch.Tensor,
+        z: torch.Tensor,
+        A_log: torch.Tensor,
+        x_proj: nn.Linear,
+        dt_proj: nn.Linear,
+        D: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        One directional SSM pass.
+
+        x_conv: [B, d_inner, L]
+        z:      [B, d_inner, L]
+        A_log:  [d_inner, d_state]
+        """
+        Bsz, d_inner, L = x_conv.shape
+        d_state = self.d_state
+
+        # Activation applied to conv output
+        x_conv = self.act(x_conv)
+
+        # x_dbl: [B*L, dt_rank + 2*d_state]
+        x_dbl = x_proj(rearrange(x_conv, "b d l -> (b l) d"))
+        dt, B_, C_ = torch.split(x_dbl, [self.dt_rank, d_state, d_state], dim=-1)
+
+        # dt: [B*L, dt_rank] -> [B*L, d_inner] -> [B, d_inner, L]
+        dt = dt_proj(dt)                                   # (B*L, d_inner)
+        dt = rearrange(dt, "(b l) d -> b d l", b=Bsz, l=L)
+
+        # B, C: [B, d_state, L]
+        B_ = rearrange(B_, "(b l) n -> b n l", b=Bsz, l=L).contiguous()
+        C_ = rearrange(C_, "(b l) n -> b n l", b=Bsz, l=L).contiguous()
+
+        A = -torch.exp(A_log.float())                      # (d_inner, d_state)
+
+        y = selective_scan_fn(
+            x_conv,
+            dt,
+            A,
+            B_,
+            C_,
+            D.float(),
+            z=z,
+            delta_bias=dt_proj.bias.float(),
+            delta_softplus=True,
+            return_last_state=False,
+        )  # (B, d_inner, L)
+
+        return y
 
     def forward(self, hidden_states: torch.Tensor, inference_params=None) -> torch.Tensor:
         """
         hidden_states: (B, L, D)
         returns: (B, L, D)
         """
-        if not self.use_fast_path or inference_params is not None:
-            raise NotImplementedError(
-                "BiMambaV2 currently only implements the fused fast path without inference cache."
-            )
+        if inference_params is not None:
+            raise NotImplementedError("BiMambaV2: inference cache path not implemented.")
 
-        bsz, seqlen, dim = hidden_states.shape
-        assert dim == self.d_model
+        Bsz, L, D = hidden_states.shape
+        assert D == self.d_model
 
-        # Project to 2 * d_inner and move to (B, 2*d_inner, L)
-        xz = rearrange(
-            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
-            "d (b l) -> b d l",
-            l=seqlen,
-        )
-        if self.in_proj.bias is not None:
-            xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+        # In-projection: [B, L, D] -> [B, L, 2*d_inner] -> [B, 2*d_inner, L]
+        xz = self.in_proj(hidden_states)                    # (B, L, 2*d_inner)
+        xz = rearrange(xz, "b l d2 -> b d2 l")              # (B, 2*d_inner, L)
+        x, z = xz.chunk(2, dim=1)                           # (B, d_inner, L) each
 
-        # Build A matrices (negative, as in S4D)
-        A = -torch.exp(self.A_log.float())      # (d_inner, d_state)
-        A_b = -torch.exp(self.A_b_log.float())  # (d_inner, d_state)
+        # ----- FORWARD DIRECTION -----
+        x_conv_f = self.conv1d(x)[..., :L]                  # (B, d_inner, L)
+        y_f = self._ssm_pass(
+            x_conv=x_conv_f,
+            z=z,
+            A_log=self.A_log,
+            x_proj=self.x_proj,
+            dt_proj=self.dt_proj,
+            D=self.D,
+        )                                                   # (B, d_inner, L)
 
-        # ---------- Forward direction ----------
-        out_fwd = mamba_inner_fn_no_out_proj(
-            xz,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            self.x_proj.weight,
-            self.dt_proj.weight,
-            A,
-            None,  # B
-            None,  # C
-            self.D.float(),
-            delta_bias=self.dt_proj.bias.float(),
-            delta_softplus=True,
-        )
+        # ----- BACKWARD DIRECTION -----
+        # flip seq -> conv -> SSM -> flip back
+        x_b, z_b = x.flip(-1), z.flip(-1)
+        x_conv_b = self.conv1d_b(x_b)[..., :L]              # (B, d_inner, L)
+        y_b = self._ssm_pass(
+            x_conv=x_conv_b,
+            z=z_b,
+            A_log=self.A_b_log,
+            x_proj=self.x_proj_b,
+            dt_proj=self.dt_proj_b,
+            D=self.D_b,
+        )                                                   # (B, d_inner, L)
+        y_b = y_b.flip(-1)
 
-        # ---------- Backward direction ----------
-        out_bwd = mamba_inner_fn_no_out_proj(
-            xz.flip([-1]),                 # reverse sequence
-            self.conv1d_b.weight,
-            self.conv1d_b.bias,
-            self.x_proj_b.weight,
-            self.dt_proj_b.weight,
-            A_b,
-            None,
-            None,
-            self.D_b.float(),
-            delta_bias=self.dt_proj_b.bias.float(),
-            delta_softplus=True,
-        )
-
-        # Combine forward & backward, bring to (B, L, d_inner)
+        # Combine directions
         if self.if_divide_out:
-            y = rearrange((out_fwd + out_bwd.flip([-1])) / 2.0, "b d l -> b l d")
+            y = (y_f + y_b) / 2.0
         else:
-            y = rearrange(out_fwd + out_bwd.flip([-1]), "b d l -> b l d")
+            y = y_f + y_b                                   # (B, d_inner, L)
 
-        out = F.linear(y, self.out_proj.weight, self.out_proj.bias)
+        # Final projection to d_model
+        y = rearrange(y, "b d l -> b l d")
+        out = self.out_proj(y)
 
         if self.init_layer_scale is not None:
             out = out * self.gamma
