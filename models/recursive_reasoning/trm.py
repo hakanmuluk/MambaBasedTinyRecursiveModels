@@ -4,6 +4,9 @@ import math
 import torch
 import copy
 import torch.nn.functional as F
+from einops import rearrange, repeat
+from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn_no_out_proj
+
 from torch import nn
 from pydantic import BaseModel
 import random
@@ -83,6 +86,242 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
     mamba_two_stage: bool = False
 
+    mamba_bimamba_v2: bool = False       # if True → use BiMamba v2 block
+    mamba_if_divide_out: bool = True     # match Vision Mamba's /2 behavior
+
+
+class BiMambaV2(nn.Module):
+    """
+    Bi-directional Mamba v2 block implemented using mamba-ssm fused kernels,
+    similar to Vision Mamba's bimamba_type == 'v2'.
+
+    Input:  hidden_states (B, L, D)
+    Output: same shape (B, L, D)
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: float = 2.0,
+        dt_rank: int | str = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        conv_bias: bool = True,
+        bias: bool = False,
+        use_fast_path: bool = True,
+        device=None,
+        dtype=None,
+        if_divide_out: bool = True,
+        init_layer_scale: float | None = None,
+    ) -> None:
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.use_fast_path = use_fast_path
+        self.if_divide_out = if_divide_out
+
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.dt_init = dt_init
+        self.dt_scale = dt_scale
+        self.dt_init_floor = dt_init_floor
+
+        self.init_layer_scale = init_layer_scale
+        if init_layer_scale is not None:
+            self.gamma = nn.Parameter(init_layer_scale * torch.ones((d_model)), requires_grad=True)
+
+        # ------------------------------------------------------------------
+        # In-projection: [B, L, D] → [B, 2 * d_inner, L] via weight @ hidden_states^T
+        # ------------------------------------------------------------------
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+
+        # Depthwise conv along sequence (done inside fused kernel)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+
+        self.activation = "silu"  # used inside fused kernel
+
+        # x_proj produces dt, B, C  (forward branch)
+        self.x_proj = nn.Linear(
+            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+        )
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        # ------------------------------------------------------------------
+        # Initialize forward dt_proj (same logic as Vision Mamba)
+        # ------------------------------------------------------------------
+        dt_init_std = self.dt_rank**-0.5 * self.dt_scale
+        if self.dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif self.dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError(f"dt_init='{self.dt_init}' not supported")
+
+        dt = torch.exp(
+            torch.rand(self.d_inner, **factory_kwargs)
+            * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        ).clamp(min=self.dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+
+        # ------------------------------------------------------------------
+        # S4D A matrices (forward and backward)
+        # ------------------------------------------------------------------
+        A = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+
+        A_b = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        A_b_log = torch.log(A_b)
+        self.A_b_log = nn.Parameter(A_b_log)
+        self.A_b_log._no_weight_decay = True
+
+        # D "skip" params (forward & backward)
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D._no_weight_decay = True
+
+        self.D_b = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D_b._no_weight_decay = True
+
+        # ------------------------------------------------------------------
+        # Backward conv + projections (separate from forward)
+        # ------------------------------------------------------------------
+        self.conv1d_b = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+
+        self.x_proj_b = nn.Linear(
+            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+        )
+        self.dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        # --- dt_proj_b initialization (same as forward dt_proj) ---
+        if self.dt_init == "constant":
+            nn.init.constant_(self.dt_proj_b.weight, dt_init_std)
+        elif self.dt_init == "random":
+            nn.init.uniform_(self.dt_proj_b.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError(f"dt_init='{self.dt_init}' not supported")
+
+        dt_b = torch.exp(
+            torch.rand(self.d_inner, **factory_kwargs)
+            * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        ).clamp(min=self.dt_init_floor)
+        inv_dt_b = dt_b + torch.log(-torch.expm1(-dt_b))
+        with torch.no_grad():
+            self.dt_proj_b.bias.copy_(inv_dt_b)
+        self.dt_proj_b.bias._no_reinit = True
+
+        # ------------------------------------------------------------------
+        # Final out projection from d_inner back to d_model
+        # ------------------------------------------------------------------
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
+    def forward(self, hidden_states: torch.Tensor, inference_params=None) -> torch.Tensor:
+        """
+        hidden_states: (B, L, D)
+        returns: (B, L, D)
+        """
+        if not self.use_fast_path or inference_params is not None:
+            raise NotImplementedError(
+                "BiMambaV2 currently only implements the fused fast path without inference cache."
+            )
+
+        bsz, seqlen, dim = hidden_states.shape
+        assert dim == self.d_model
+
+        # Project to 2 * d_inner and move to (B, d_inner*2, L)
+        xz = rearrange(
+            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+            "d (b l) -> b d l",
+            l=seqlen,
+        )
+        if self.in_proj.bias is not None:
+            xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+
+        A = -torch.exp(self.A_log.float())      # (d_inner, d_state)
+        A_b = -torch.exp(self.A_b_log.float())  # (d_inner, d_state)
+
+        # ---------- Forward direction ----------
+        out_fwd = mamba_inner_fn_no_out_proj(
+            xz,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            self.x_proj.weight,
+            self.dt_proj.weight,
+            A,
+            None,  # B
+            None,  # C
+            self.D.float(),
+            delta_bias=self.dt_proj.bias.float(),
+            delta_softplus=True,
+        )
+
+        # ---------- Backward direction ----------
+        out_bwd = mamba_inner_fn_no_out_proj(
+            xz.flip([-1]),                 # reverse sequence
+            self.conv1d_b.weight,
+            self.conv1d_b.bias,
+            self.x_proj_b.weight,
+            self.dt_proj_b.weight,
+            A_b,
+            None,
+            None,
+            self.D_b.float(),
+            delta_bias=self.dt_proj_b.bias.float(),
+            delta_softplus=True,
+        )
+
+        # Combine forward & backward, bring to (B, L, d_inner)
+        if not self.if_divide_out:
+            y = rearrange(out_fwd + out_bwd.flip([-1]), "b d l -> b l d")
+        else:
+            y = rearrange((out_fwd + out_bwd.flip([-1])) / 2.0, "b d l -> b l d")
+
+        out = F.linear(y, self.out_proj.weight, self.out_proj.bias)
+
+        if self.init_layer_scale is not None:
+            out = out * self.gamma
+
+        return out
+
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -92,25 +331,62 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
+        # Decide mode
         if self.config.mlp_t:
-            # Original mlp_t mode: MLP across sequence length (L)
+            self.mode = "mlp_t"
+        elif self.config.mamba_bimamba_v2:
+            self.mode = "bimamba_v2"
+        elif self.config.mamba_two_stage:
+            self.mode = "mamba_two_stage"
+        else:
+            self.mode = "simple_mamba"
+
+        # ------------------------------------------------------------------
+        # 1) mlp_t mode (original TRM)
+        # ------------------------------------------------------------------
+        if self.mode == "mlp_t":
             self.puzzle_emb_len = (
                 -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
                 if self.config.puzzle_emb_len == 0
                 else self.config.puzzle_emb_len
             )
             self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len,  # L
+                hidden_size=self.config.seq_len + self.puzzle_emb_len,
                 expansion=config.expansion,
             )
             self.mamba = None
             self.mamba_first = None
             self.mamba_second = None
-        elif self.config.mamba_two_stage:
-            # 🔹 Two-stage bi-Mamba with separate fwd/bwd nets
+            self.dir_fwd = None
+            self.dir_bwd = None
+
+        # ------------------------------------------------------------------
+        # 2) NEW: BiMamba v2 mode (one block, v2 SSMs inside)
+        # ------------------------------------------------------------------
+        elif self.mode == "bimamba_v2":
+            self.mlp_t = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+
+            self.mamba = BiMambaV2(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                device=None,
+                dtype=self.forward_dtype,
+                if_divide_out=self.config.mamba_if_divide_out,
+            )
+
+        # ------------------------------------------------------------------
+        # 3) Two-stage Mamba (your previous design)
+        # ------------------------------------------------------------------
+        elif self.mode == "mamba_two_stage":
             self.mlp_t = None
 
-            # First Mamba layer
             self.mamba_first = Mamba(
                 d_model=config.hidden_size,
                 d_state=config.mamba_d_state,
@@ -121,7 +397,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 device=None,
                 dtype=self.forward_dtype,
             )
-            # Direction-specific networks after first Mamba
+
             self.dir_fwd = SwiGLU(
                 hidden_size=config.hidden_size,
                 expansion=config.expansion,
@@ -131,7 +407,6 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 expansion=config.expansion,
             )
 
-            # Second Mamba layer
             self.mamba_second = Mamba(
                 d_model=config.hidden_size,
                 d_state=config.mamba_d_state,
@@ -142,9 +417,13 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 device=None,
                 dtype=self.forward_dtype,
             )
+
             self.mamba = None
+
+        # ------------------------------------------------------------------
+        # 4) Default: single shared Mamba + manual bi-direction via flip
+        # ------------------------------------------------------------------
         else:
-            # 🔹 Simple bidirectional Mamba over hidden_size (existing behavior)
             self.mlp_t = None
             self.mamba_first = None
             self.mamba_second = None
@@ -162,82 +441,67 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 dtype=self.forward_dtype,
             )
 
-        # MLP over hidden_size (same as original TRM block)
+        # final MLP over hidden_size for all modes
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
 
-
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # B, L, D = hidden_states.shape
+        # cos_sin is currently unused in the Mamba paths
+        # hidden_states: [B, L, D]
 
-        if self.config.mlp_t:
-            # Original mlp_t behavior: sequence-wise MLP
+        # ---------------- mlp_t ----------------
+        if self.mode == "mlp_t":
             hidden_states = hidden_states.transpose(1, 2)  # [B, D, L]
             out = self.mlp_t(hidden_states)
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1, 2)  # back to [B, L, D]
+            hidden_states = hidden_states.transpose(1, 2)  # [B, L, D]
 
-        elif self.config.mamba_two_stage:
-            # 🔹 Two-stage bi-Mamba with directional networks
+        # ---------------- BiMamba v2 (new) ----------------
+        elif self.mode == "bimamba_v2":
+            x = hidden_states.contiguous()
+            y = self.mamba(x)  # BiMambaV2 forward
+            hidden_states = rms_norm(x + y, variance_epsilon=self.norm_eps)
 
+        # ---------------- two-stage Mamba ----------------
+        elif self.mode == "mamba_two_stage":
             x = hidden_states.contiguous()
 
-            # ----- Stage 1 -----
-            # Bi-Mamba (first layer)
             y1_fwd = self.mamba_first(x)
-
             rev_x = torch.flip(x, dims=[1])
             y1_bwd = self.mamba_first(rev_x)
             y1_bwd = torch.flip(y1_bwd, dims=[1])
 
-            # Direction-specific networks
             y1_fwd = self.dir_fwd(y1_fwd)
             y1_bwd = self.dir_bwd(y1_bwd)
 
-            # Sum fwd + bwd branches
-            y1 = y1_fwd + y1_bwd      # if you prefer, you can scale: 0.5 * (y1_fwd + y1_bwd)
-
-            # Residual + norm
+            y1 = y1_fwd + y1_bwd
             x = rms_norm(x + y1, variance_epsilon=self.norm_eps)
 
-            # ----- Stage 2 -----
             y2_fwd = self.mamba_second(x)
-
             rev_x2 = torch.flip(x, dims=[1])
             y2_bwd = self.mamba_second(rev_x2)
             y2_bwd = torch.flip(y2_bwd, dims=[1])
 
-            # Sum second-layer bi-Mamba outputs
-            y2 = y2_fwd + y2_bwd      # again, could be 0.5 * (...) if you want to keep scale
-
+            y2 = y2_fwd + y2_bwd
             hidden_states = rms_norm(x + y2, variance_epsilon=self.norm_eps)
 
+        # ---------------- simple shared Mamba + flip ----------------
         else:
-            # 🔹 Original simple bidirectional Mamba
             hidden_states = hidden_states.contiguous()
-
-            # Forward pass
             y_fwd = self.mamba(hidden_states)
-
-            # Backward pass (on reversed sequence)
             reversed_input = torch.flip(hidden_states, dims=[1])
             y_bwd = self.mamba(reversed_input)
             y_bwd = torch.flip(y_bwd, dims=[1])
-
-            # Combine both directions
             y = 0.5 * (y_fwd + y_bwd)
-
-            # Residual + RMSNorm
             hidden_states = rms_norm(hidden_states + y, variance_epsilon=self.norm_eps)
 
-        # Final MLP over hidden_size (shared for all modes)
+        # final MLP
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
 
         return hidden_states
-
 
 
 class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
