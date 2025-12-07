@@ -141,11 +141,11 @@ class BiMambaV2(nn.Module):
             self.gamma = nn.Parameter(init_layer_scale * torch.ones((d_model)), requires_grad=True)
 
         # ------------------------------------------------------------------
-        # In-projection: [B, L, D] → [B, 2 * d_inner, L] via weight @ hidden_states^T
+        # In-projection: [B, L, D] → [B, 2 * d_inner, L]
         # ------------------------------------------------------------------
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
-        # Depthwise conv along sequence (done inside fused kernel)
+        # Depthwise conv along sequence (forward branch)
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -183,7 +183,9 @@ class BiMambaV2(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
+        # do not reinit; do not decay
         self.dt_proj.bias._no_reinit = True
+        self.dt_proj.bias._no_weight_decay = True
 
         # ------------------------------------------------------------------
         # S4D A matrices (forward and backward)
@@ -206,7 +208,7 @@ class BiMambaV2(nn.Module):
         self.A_b_log = nn.Parameter(A_b_log)
         self.A_b_log._no_weight_decay = True
 
-        # D "skip" params (forward & backward)
+        # D "skip" params (forward & backward) – no weight decay
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
         self.D._no_weight_decay = True
 
@@ -247,7 +249,9 @@ class BiMambaV2(nn.Module):
         inv_dt_b = dt_b + torch.log(-torch.expm1(-dt_b))
         with torch.no_grad():
             self.dt_proj_b.bias.copy_(inv_dt_b)
+        # do not reinit; do not decay
         self.dt_proj_b.bias._no_reinit = True
+        self.dt_proj_b.bias._no_weight_decay = True
 
         # ------------------------------------------------------------------
         # Final out projection from d_inner back to d_model
@@ -267,7 +271,7 @@ class BiMambaV2(nn.Module):
         bsz, seqlen, dim = hidden_states.shape
         assert dim == self.d_model
 
-        # Project to 2 * d_inner and move to (B, d_inner*2, L)
+        # Project to 2 * d_inner and move to (B, 2*d_inner, L)
         xz = rearrange(
             self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
             "d (b l) -> b d l",
@@ -276,6 +280,7 @@ class BiMambaV2(nn.Module):
         if self.in_proj.bias is not None:
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 
+        # Build A matrices (negative, as in S4D)
         A = -torch.exp(self.A_log.float())      # (d_inner, d_state)
         A_b = -torch.exp(self.A_b_log.float())  # (d_inner, d_state)
 
@@ -310,10 +315,10 @@ class BiMambaV2(nn.Module):
         )
 
         # Combine forward & backward, bring to (B, L, d_inner)
-        if not self.if_divide_out:
-            y = rearrange(out_fwd + out_bwd.flip([-1]), "b d l -> b l d")
-        else:
+        if self.if_divide_out:
             y = rearrange((out_fwd + out_bwd.flip([-1])) / 2.0, "b d l -> b l d")
+        else:
+            y = rearrange(out_fwd + out_bwd.flip([-1]), "b d l -> b l d")
 
         out = F.linear(y, self.out_proj.weight, self.out_proj.bias)
 
@@ -321,6 +326,7 @@ class BiMambaV2(nn.Module):
             out = out * self.gamma
 
         return out
+
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
