@@ -54,9 +54,12 @@ class PretrainConfig(pydantic.BaseModel):
     global_batch_size: int
     epochs: int
 
-    lr: float
+    lr: float                         # base LR for non-Mamba params
     lr_min_ratio: float
     lr_warmup_steps: int
+
+    # NEW: optional higher LR for Mamba blocks (if None → use lr)
+    lr_mamba: Optional[float] = None
 
     weight_decay: float
     beta1: float
@@ -120,6 +123,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 # ---------------------------------------------------------
 # Helper: split parameters into decay / no-decay groups
 # based on the `_no_weight_decay` flag.
+# (Kept for reference; not used anymore.)
 # ---------------------------------------------------------
 def split_weight_decay_groups(model: nn.Module):
     decay_params: List[nn.Parameter] = []
@@ -134,6 +138,46 @@ def split_weight_decay_groups(model: nn.Module):
             decay_params.append(p)
 
     return decay_params, no_decay_params
+
+
+# ---------------------------------------------------------
+# NEW: split params into 4 groups:
+#   - Mamba + decay
+#   - Mamba + no-decay
+#   - Other + decay
+#   - Other + no-decay
+#
+# "Mamba params" are detected by "mamba" in their name,
+# which matches:
+#   - TinyRecursiveReasoningModel_ACTV1Block.mamba
+#   - .mamba_first / .mamba_second
+#   - BiMambaV2 instance assigned to `mamba`, etc.
+# ---------------------------------------------------------
+def split_param_groups_mamba(model: nn.Module):
+    mamba_decay: List[nn.Parameter] = []
+    mamba_no_decay: List[nn.Parameter] = []
+    other_decay: List[nn.Parameter] = []
+    other_no_decay: List[nn.Parameter] = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        no_wd = getattr(p, "_no_weight_decay", False)
+        is_mamba = "mamba" in name.lower()
+
+        if is_mamba:
+            if no_wd:
+                mamba_no_decay.append(p)
+            else:
+                mamba_decay.append(p)
+        else:
+            if no_wd:
+                other_no_decay.append(p)
+            else:
+                other_decay.append(p)
+
+    return mamba_decay, mamba_no_decay, other_decay, other_no_decay
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
@@ -169,30 +213,58 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     # -----------------------------------------------------
     # Build optimizer(s) with proper weight-decay handling
+    # and separate LRs for Mamba vs others
     # -----------------------------------------------------
-    decay_params, no_decay_params = split_weight_decay_groups(model)
+    mamba_decay, mamba_no_decay, other_decay, other_no_decay = split_param_groups_mamba(model)
+    mamba_base_lr = config.lr_mamba or config.lr  # if lr_mamba is None, fall back to lr
 
     optimizers: List[torch.optim.Optimizer] = []
     optimizer_lrs: List[float] = []
 
-    if config.arch.puzzle_emb_ndim == 0:
-        # No puzzle embedding: only AdamATan2 on the model
-        if len(decay_params):
+    # NOTE: puzzle_emb_ndim is passed via arch extras into TinyRecursiveReasoningModel config
+    if getattr(config.arch, "puzzle_emb_ndim", 0) == 0:
+        # No puzzle embedding: only AdamATan2 on the model params
+
+        # --- Mamba params ---
+        if len(mamba_decay):
             optimizers.append(
                 AdamATan2(
-                    decay_params,
+                    mamba_decay,
                     lr=0,  # will be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(mamba_base_lr)
+
+        if len(mamba_no_decay):
+            optimizers.append(
+                AdamATan2(
+                    mamba_no_decay,
+                    lr=0,  # will be set by scheduler
+                    weight_decay=0.0,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(mamba_base_lr)
+
+        # --- Non-Mamba params ---
+        if len(other_decay):
+            optimizers.append(
+                AdamATan2(
+                    other_decay,
+                    lr=0,
                     weight_decay=config.weight_decay,
                     betas=(config.beta1, config.beta2),
                 )
             )
             optimizer_lrs.append(config.lr)
 
-        if len(no_decay_params):
+        if len(other_no_decay):
             optimizers.append(
                 AdamATan2(
-                    no_decay_params,
-                    lr=0,  # will be set by scheduler
+                    other_no_decay,
+                    lr=0,
                     weight_decay=0.0,
                     betas=(config.beta1, config.beta2),
                 )
@@ -212,7 +284,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         optimizer_lrs.append(config.puzzle_emb_lr)
 
     else:
-        # Learn puzzle embeddings + model (with split decay/no-decay)
+        # Learn puzzle embeddings + model (Mamba vs non-Mamba, decay vs no-decay)
         optimizers.append(
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
@@ -223,22 +295,46 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         )
         optimizer_lrs.append(config.puzzle_emb_lr)
 
-        if len(decay_params):
+        # --- Mamba params ---
+        if len(mamba_decay):
             optimizers.append(
                 AdamATan2(
-                    decay_params,
-                    lr=0,  # will be set by scheduler
+                    mamba_decay,
+                    lr=0,
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(mamba_base_lr)
+
+        if len(mamba_no_decay):
+            optimizers.append(
+                AdamATan2(
+                    mamba_no_decay,
+                    lr=0,
+                    weight_decay=0.0,
+                    betas=(config.beta1, config.beta2),
+                )
+            )
+            optimizer_lrs.append(mamba_base_lr)
+
+        # --- Non-Mamba params ---
+        if len(other_decay):
+            optimizers.append(
+                AdamATan2(
+                    other_decay,
+                    lr=0,
                     weight_decay=config.weight_decay,
                     betas=(config.beta1, config.beta2),
                 )
             )
             optimizer_lrs.append(config.lr)
 
-        if len(no_decay_params):
+        if len(other_no_decay):
             optimizers.append(
                 AdamATan2(
-                    no_decay_params,
-                    lr=0,  # will be set by scheduler
+                    other_no_decay,
+                    lr=0,
                     weight_decay=0.0,
                     betas=(config.beta1, config.beta2),
                 )
