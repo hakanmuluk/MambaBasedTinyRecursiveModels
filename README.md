@@ -118,7 +118,7 @@ arch.H_cycles=3 arch.L_cycles=6 \
 +run_name=${run_name} \
 ema=True
 
-run_name="pretrain_bimamba_sudoku"
+run_name="pretrain_bimamba_sudoku_different_lrs"
 
 python pretrain.py \
 arch=trm \
@@ -139,7 +139,9 @@ arch.H_cycles=3 \
 arch.L_cycles=6 \
 +run_name=${run_name} \
 ema=True \
-lr_mamba=1e-3
+lr_mamba=1e-3 \
+arch.mamba_bimamba_v2=True \
+arch.mlp_t=False \
 
 ```
 
