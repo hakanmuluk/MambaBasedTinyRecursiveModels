@@ -126,10 +126,10 @@ data_paths="[data/sudoku-extreme-1k-aug-1000]" \
 data_paths_test="[]" \
 evaluators="[]" \
 global_batch_size=512 \
-epochs=35000 \
+epochs=30000 \
 eval_interval=5000 \
 lr=1e-4 \
-lr_min_ratio=0.05 \
+lr_min_ratio=0.1 \
 lr_warmup_steps=2000 \
 puzzle_emb_lr=1e-4 \
 weight_decay=0.1 \
@@ -138,7 +138,8 @@ arch.L_layers=2 \
 arch.H_cycles=3 \
 arch.L_cycles=6 \
 +run_name=${run_name} \
-ema=True
+ema=True \
+lr_mamba=1e-3
 
 ```
 
