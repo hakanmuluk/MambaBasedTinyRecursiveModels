@@ -143,6 +143,34 @@ lr_mamba=1e-3 \
 arch.mamba_bimamba_v2=True \
 arch.mlp_t=False \
 
+run_name="pretrain_bimamba_sudoku_different_lrs"
+
+python pretrain.py \
+arch=trm \
+data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+data_paths_test="[]" \
+evaluators="[]" \
+global_batch_size=512 \
+epochs=30000 \
+eval_interval=5000 \
+lr=1e-4 \
+lr_mamba=5e-4 \
+lr_min_ratio=0.1 \
+lr_warmup_steps=2000 \
+weight_decay=0.1 \
+puzzle_emb_lr=1e-4 \
+puzzle_emb_weight_decay=0.1 \
+grad_clip=1.0 \
+arch.L_layers=2 \
+arch.H_cycles=3 \
+arch.L_cycles=6 \
+arch.mamba_bimamba_v2=True \
+arch.mlp_t=False \
+ema=True \
++run_name=${run_name} \
+load_checkpoint="workspace/MambaBasedTinyRecursiveModels/checkpoints/pretrain_bi-mamba_sudoku/step_19530"
+
+
 ```
 
 Expected: Around 75% exact-accuracy (+- 2%)
