@@ -168,7 +168,7 @@ arch.mamba_bimamba_v2=True \
 arch.mlp_t=False \
 ema=True \
 +run_name=${run_name} \
-load_checkpoint="workspace/MambaBasedTinyRecursiveModels/checkpoints/pretrain_bi-mamba_sudoku/step_19530"
+load_checkpoint="/workspace/MambaBasedTinyRecursiveModels/checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/pretrain_bi-mamba_sudoku/step_19530"
 
 
 ```
