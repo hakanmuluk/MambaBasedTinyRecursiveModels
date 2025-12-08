@@ -143,7 +143,7 @@ lr_mamba=1e-3 \
 arch.mamba_bimamba_v2=True \
 arch.mlp_t=False \
 
-run_name="pretrain_bimamba_sudoku_different_lrs"
+run_name="pretrain_bimamba_sudoku_different_lrs_cont"
 
 python pretrain.py \
 arch=trm \
