@@ -32,6 +32,7 @@ mamba_expand: 2.0
 mamba_dt_rank: auto
 
 # 🔹 Our modes (exactly one of these should be true)
+mamba_bimamba_v2_with_transformer: True
 mamba_two_stage: False          # disable old two-stage design
-mamba_bimamba_v2: True          # enable new BiMamba v2 block
+mamba_bimamba_v2: False          # enable new BiMamba v2 block
 mamba_if_divide_out: True       # match Vision Mamba's /2 behavior
