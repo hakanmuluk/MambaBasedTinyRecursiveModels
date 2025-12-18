@@ -17,6 +17,7 @@ from models.layers import (
     rms_norm,
     LinearSwish,
     SwiGLU,
+    Attention,
     RotaryEmbedding,
     CosSin,
     CastedEmbedding,
@@ -86,6 +87,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mamba_dt_rank: str = "auto"  # passed directly to Mamba (e.g. "auto")
 
     mamba_two_stage: bool = False
+    mamba_bimamba_v2_with_transformer: bool = False  # BiMambaV2 then self-attn then FFN
+
 
     mamba_bimamba_v2: bool = False       # if True → use BiMamba v2 block
     mamba_if_divide_out: bool = True     # match Vision Mamba's /2 behavior
@@ -344,12 +347,15 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         # Decide mode
         if self.config.mlp_t:
             self.mode = "mlp_t"
+        elif self.config.mamba_bimamba_v2_with_transformer:
+            self.mode = "bimamba_v2_with_transformer"
         elif self.config.mamba_bimamba_v2:
             self.mode = "bimamba_v2"
         elif self.config.mamba_two_stage:
             self.mode = "mamba_two_stage"
         else:
             self.mode = "simple_mamba"
+
 
         # ------------------------------------------------------------------
         # 1) mlp_t mode (original TRM)
@@ -390,6 +396,35 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 dtype=self.forward_dtype,
                 if_divide_out=self.config.mamba_if_divide_out,
             )
+        # ------------------------------------------------------------------
+        # 2b) NEW: BiMamba v2 + Transformer (self-attn) in the same layer
+        # ------------------------------------------------------------------
+        elif self.mode == "bimamba_v2_with_transformer":
+            self.mlp_t = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+
+            self.mamba = BiMambaV2(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                device=None,
+                dtype=self.forward_dtype,
+                if_divide_out=self.config.mamba_if_divide_out,
+            )
+
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False,
+            )
+
 
         # ------------------------------------------------------------------
         # 3) Two-stage Mamba (your previous design)
@@ -429,6 +464,8 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             )
 
             self.mamba = None
+
+
 
         # ------------------------------------------------------------------
         # 4) Default: single shared Mamba + manual bi-direction via flip
@@ -496,6 +533,17 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
 
             y2 = y2_fwd + y2_bwd
             hidden_states = rms_norm(x + y2, variance_epsilon=self.norm_eps)
+
+        elif self.mode == "bimamba_v2_with_transformer":
+            x = hidden_states.contiguous()
+
+            # (1) BiMambaV2
+            y = self.mamba(x)
+            hidden_states = rms_norm(x + y, variance_epsilon=self.norm_eps)
+
+            # (2) Transformer self-attention (same logic as original transformer block)
+            attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+            hidden_states = rms_norm(hidden_states + attn_out, variance_epsilon=self.norm_eps)
 
         # ---------------- simple shared Mamba + flip ----------------
         else:
