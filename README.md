@@ -187,7 +187,6 @@ lr_warmup_steps=2000 \
 weight_decay=0.1 \
 puzzle_emb_lr=1e-4 \
 puzzle_emb_weight_decay=0.1 \
-grad_clip=1.0 \
 arch.L_layers=2 \
 arch.H_cycles=3 \
 arch.L_cycles=6 \
