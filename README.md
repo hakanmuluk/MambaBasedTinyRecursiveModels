@@ -170,7 +170,7 @@ ema=True \
 +run_name=${run_name} \
 load_checkpoint="/workspace/MambaBasedTinyRecursiveModels/checkpoints/Sudoku-extreme-1k-aug-1000-ACT-torch/pretrain_bi-mamba_sudoku/step_19530"
 
-run_name="pretrain_bimamba_sudoku_different_lrs_cont"
+run_name="jamba"
 
 python pretrain.py \
 arch=trm \
