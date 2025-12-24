@@ -221,7 +221,7 @@ arch.mlp_t=False \
 ema=True \
 +run_name=${run_name} \
 
-run_name="bilstm"
+run_name="bilstm_2"
 
 python pretrain.py \
 arch=trm \
@@ -231,9 +231,9 @@ evaluators="[]" \
 global_batch_size=512 \
 epochs=30000 \
 eval_interval=5000 \
-lr=1e-4 \
+lr=3e-5 \
 lr_mamba=1e-4 \
-lr_min_ratio=1 \
+lr_min_ratio=0.2 \
 lr_warmup_steps=2000 \
 weight_decay=0.1 \
 puzzle_emb_lr=1e-4 \
