@@ -17,7 +17,8 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+
+from torch.optim import AdamW
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -26,12 +27,12 @@ from models.ema import EMAHelper
 
 
 class LossConfig(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(extra='allow')
+    model_config = pydantic.ConfigDict(extra="allow")
     name: str
 
 
 class ArchConfig(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(extra='allow')
+    model_config = pydantic.ConfigDict(extra="allow")
     name: str
     loss: LossConfig
 
@@ -54,16 +55,24 @@ class PretrainConfig(pydantic.BaseModel):
     global_batch_size: int
     epochs: int
 
-    lr: float                         # base LR for non-Mamba params
+    lr: float  # base LR for non-Mamba params
     lr_min_ratio: float
     lr_warmup_steps: int
 
-    # NEW: optional higher LR for Mamba blocks (if None → use lr)
+    # Optional higher LR for Mamba blocks (if None → use lr)
     lr_mamba: Optional[float] = None
+
+    # Optional separate LR / WD for BiLSTM blocks (if None -> fallback to base)
+    lr_bilstm: Optional[float] = None
+    bilstm_weight_decay: Optional[float] = None
 
     weight_decay: float
     beta1: float
     beta2: float
+    adamw_eps: float = 1e-8
+
+    # Optional gradient clipping (recommended for RNN/LSTM stability)
+    grad_clip_norm: Optional[float] = 1.0  # set to None to disable
 
     # Puzzle embedding
     puzzle_emb_lr: float
@@ -102,7 +111,9 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
             seed=config.seed,
-            dataset_paths=config.data_paths_test if len(config.data_paths_test) > 0 and split == "test" else config.data_paths,
+            dataset_paths=(
+                config.data_paths_test if len(config.data_paths_test) > 0 and split == "test" else config.data_paths
+            ),
             rank=rank,
             num_replicas=world_size,
             **kwargs,
@@ -129,7 +140,7 @@ def split_weight_decay_groups(model: nn.Module):
     decay_params: List[nn.Parameter] = []
     no_decay_params: List[nn.Parameter] = []
 
-    for name, p in model.named_parameters():
+    for _name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if getattr(p, "_no_weight_decay", False):
@@ -141,21 +152,25 @@ def split_weight_decay_groups(model: nn.Module):
 
 
 # ---------------------------------------------------------
-# NEW: split params into 4 groups:
+# NEW: split params into 6 groups:
 #   - Mamba + decay
 #   - Mamba + no-decay
+#   - BiLSTM + decay
+#   - BiLSTM + no-decay
 #   - Other + decay
 #   - Other + no-decay
 #
-# "Mamba params" are detected by "mamba" in their name,
-# which matches:
-#   - TinyRecursiveReasoningModel_ACTV1Block.mamba
-#   - .mamba_first / .mamba_second
-#   - BiMambaV2 instance assigned to `mamba`, etc.
+# Rules:
+#   - Any param with _no_weight_decay flag -> no-decay
+#   - Any bias -> no-decay
+#   - Any 1D param (norm scales, etc.) -> no-decay
+#   - Any LSTM recurrent weights (weight_hh*) -> no-decay
 # ---------------------------------------------------------
-def split_param_groups_mamba(model: nn.Module):
+def split_param_groups_mamba_bilstm(model: nn.Module):
     mamba_decay: List[nn.Parameter] = []
     mamba_no_decay: List[nn.Parameter] = []
+    bilstm_decay: List[nn.Parameter] = []
+    bilstm_no_decay: List[nn.Parameter] = []
     other_decay: List[nn.Parameter] = []
     other_no_decay: List[nn.Parameter] = []
 
@@ -163,21 +178,30 @@ def split_param_groups_mamba(model: nn.Module):
         if not p.requires_grad:
             continue
 
-        no_wd = getattr(p, "_no_weight_decay", False)
-        is_mamba = "mamba" in name.lower()
+        n = name.lower()
+
+        no_wd = (
+            getattr(p, "_no_weight_decay", False)
+            or n.endswith(".bias")
+            or ".bias" in n
+            or p.ndim == 1
+        )
+
+        is_mamba = "mamba" in n
+        is_lstm = ("bilstm" in n) or ("lstm" in n)
+
+        # never decay LSTM recurrent matrices
+        if is_lstm and ("weight_hh" in n):
+            no_wd = True
 
         if is_mamba:
-            if no_wd:
-                mamba_no_decay.append(p)
-            else:
-                mamba_decay.append(p)
+            (mamba_no_decay if no_wd else mamba_decay).append(p)
+        elif is_lstm:
+            (bilstm_no_decay if no_wd else bilstm_decay).append(p)
         else:
-            if no_wd:
-                other_no_decay.append(p)
-            else:
-                other_decay.append(p)
+            (other_no_decay if no_wd else other_decay).append(p)
 
-    return mamba_decay, mamba_no_decay, other_decay, other_no_decay
+    return mamba_decay, mamba_no_decay, bilstm_decay, bilstm_no_decay, other_decay, other_no_decay
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
@@ -213,62 +237,59 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     # -----------------------------------------------------
     # Build optimizer(s) with proper weight-decay handling
-    # and separate LRs for Mamba vs others
+    # and separate LRs for Mamba vs BiLSTM vs others
     # -----------------------------------------------------
-    mamba_decay, mamba_no_decay, other_decay, other_no_decay = split_param_groups_mamba(model)
-    mamba_base_lr = config.lr_mamba or config.lr  # if lr_mamba is None, fall back to lr
+    (
+        mamba_decay,
+        mamba_no_decay,
+        bilstm_decay,
+        bilstm_no_decay,
+        other_decay,
+        other_no_decay,
+    ) = split_param_groups_mamba_bilstm(model)
+
+    mamba_base_lr = config.lr_mamba or config.lr
+    bilstm_base_lr = config.lr_bilstm or config.lr
+    bilstm_wd = config.bilstm_weight_decay if (config.bilstm_weight_decay is not None) else config.weight_decay
 
     optimizers: List[torch.optim.Optimizer] = []
     optimizer_lrs: List[float] = []
 
+    def _make_adamw(params: List[nn.Parameter], *, weight_decay: float):
+        return AdamW(
+            params,
+            lr=0,  # will be set by scheduler
+            weight_decay=weight_decay,
+            betas=(config.beta1, config.beta2),
+            eps=config.adamw_eps,
+        )
+
     # NOTE: puzzle_emb_ndim is passed via arch extras into TinyRecursiveReasoningModel config
     if getattr(config.arch, "puzzle_emb_ndim", 0) == 0:
-        # No puzzle embedding: only AdamATan2 on the model params
+        # No puzzle embedding: only AdamW on the model params
 
         # --- Mamba params ---
         if len(mamba_decay):
-            optimizers.append(
-                AdamATan2(
-                    mamba_decay,
-                    lr=0,  # will be set by scheduler
-                    weight_decay=config.weight_decay,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
+            optimizers.append(_make_adamw(mamba_decay, weight_decay=config.weight_decay))
             optimizer_lrs.append(mamba_base_lr)
-
         if len(mamba_no_decay):
-            optimizers.append(
-                AdamATan2(
-                    mamba_no_decay,
-                    lr=0,  # will be set by scheduler
-                    weight_decay=0.0,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
+            optimizers.append(_make_adamw(mamba_no_decay, weight_decay=0.0))
             optimizer_lrs.append(mamba_base_lr)
 
-        # --- Non-Mamba params ---
-        if len(other_decay):
-            optimizers.append(
-                AdamATan2(
-                    other_decay,
-                    lr=0,
-                    weight_decay=config.weight_decay,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
-            optimizer_lrs.append(config.lr)
+        # --- BiLSTM params ---
+        if len(bilstm_decay):
+            optimizers.append(_make_adamw(bilstm_decay, weight_decay=bilstm_wd))
+            optimizer_lrs.append(bilstm_base_lr)
+        if len(bilstm_no_decay):
+            optimizers.append(_make_adamw(bilstm_no_decay, weight_decay=0.0))
+            optimizer_lrs.append(bilstm_base_lr)
 
+        # --- Non-Mamba / Non-LSTM params ---
+        if len(other_decay):
+            optimizers.append(_make_adamw(other_decay, weight_decay=config.weight_decay))
+            optimizer_lrs.append(config.lr)
         if len(other_no_decay):
-            optimizers.append(
-                AdamATan2(
-                    other_no_decay,
-                    lr=0,
-                    weight_decay=0.0,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
+            optimizers.append(_make_adamw(other_no_decay, weight_decay=0.0))
             optimizer_lrs.append(config.lr)
 
     elif config.freeze_weights:
@@ -284,7 +305,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         optimizer_lrs.append(config.puzzle_emb_lr)
 
     else:
-        # Learn puzzle embeddings + model (Mamba vs non-Mamba, decay vs no-decay)
+        # Learn puzzle embeddings + model params
         optimizers.append(
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
@@ -297,48 +318,26 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
         # --- Mamba params ---
         if len(mamba_decay):
-            optimizers.append(
-                AdamATan2(
-                    mamba_decay,
-                    lr=0,
-                    weight_decay=config.weight_decay,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
+            optimizers.append(_make_adamw(mamba_decay, weight_decay=config.weight_decay))
             optimizer_lrs.append(mamba_base_lr)
-
         if len(mamba_no_decay):
-            optimizers.append(
-                AdamATan2(
-                    mamba_no_decay,
-                    lr=0,
-                    weight_decay=0.0,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
+            optimizers.append(_make_adamw(mamba_no_decay, weight_decay=0.0))
             optimizer_lrs.append(mamba_base_lr)
 
-        # --- Non-Mamba params ---
-        if len(other_decay):
-            optimizers.append(
-                AdamATan2(
-                    other_decay,
-                    lr=0,
-                    weight_decay=config.weight_decay,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
-            optimizer_lrs.append(config.lr)
+        # --- BiLSTM params ---
+        if len(bilstm_decay):
+            optimizers.append(_make_adamw(bilstm_decay, weight_decay=bilstm_wd))
+            optimizer_lrs.append(bilstm_base_lr)
+        if len(bilstm_no_decay):
+            optimizers.append(_make_adamw(bilstm_no_decay, weight_decay=0.0))
+            optimizer_lrs.append(bilstm_base_lr)
 
+        # --- other params ---
+        if len(other_decay):
+            optimizers.append(_make_adamw(other_decay, weight_decay=config.weight_decay))
+            optimizer_lrs.append(config.lr)
         if len(other_no_decay):
-            optimizers.append(
-                AdamATan2(
-                    other_no_decay,
-                    lr=0,
-                    weight_decay=0.0,
-                    betas=(config.beta1, config.beta2),
-                )
-            )
+            optimizers.append(_make_adamw(other_no_decay, weight_decay=0.0))
             optimizer_lrs.append(config.lr)
 
     return model, optimizers, optimizer_lrs
@@ -441,7 +440,6 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
 
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
     data_paths = config.data_paths_test if len(config.data_paths_test) > 0 else config.data_paths
-    # Initialize evaluators
     evaluators = []
     for cfg in config.evaluators:
         for data_path in data_paths:
@@ -462,7 +460,7 @@ def train_batch(
     world_size: int,
 ):
     train_state.step += 1
-    if train_state.step > train_state.total_steps:  # At most train_total_steps
+    if train_state.step > train_state.total_steps:
         return
 
     # To device
@@ -474,19 +472,21 @@ def train_batch(
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(
-        carry=train_state.carry, batch=batch, return_keys=[]
-    )
+    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
     ((1 / global_batch_size) * loss).backward()
 
-    # Allreduce
+    # Allreduce grads
     if world_size > 1:
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
 
-    # Apply optimizer
+    # Gradient clipping (recommended for LSTM stability)
+    if config.grad_clip_norm is not None:
+        torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), config.grad_clip_norm)
+
+    # Apply optimizer(s)
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
@@ -501,8 +501,7 @@ def train_batch(
     if len(metrics):
         assert not any(v.requires_grad for v in metrics.values())
 
-        metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-        # Reduce and reconstruct
+        metric_keys = list(sorted(metrics.keys()))
         metric_values = torch.stack([metrics[k] for k in metric_keys])
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
@@ -511,8 +510,7 @@ def train_batch(
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
 
-            # Postprocess
-            count = max(reduced_metrics["count"], 1)  # Avoid NaNs
+            count = max(reduced_metrics["count"], 1)
             reduced_metrics = {
                 f"train/{k}": v / (global_batch_size if k.endswith("loss") else count)
                 for k, v in reduced_metrics.items()
@@ -540,7 +538,6 @@ def evaluate(
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
 
-        # Run evaluation
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
 
         save_preds = {}
@@ -556,19 +553,16 @@ def evaluate(
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
 
-            # To device
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
-            # Forward
             inference_steps = 0
             while True:
                 carry, loss, metrics, preds, all_finish = train_state.model(
                     carry=carry, batch=batch, return_keys=return_keys
                 )
                 inference_steps += 1
-
                 if all_finish:
                     break
 
@@ -579,32 +573,25 @@ def evaluate(
                 for k, v in collection.items():
                     if k in config.eval_save_outputs:
                         save_preds.setdefault(k, [])
-                        save_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
+                        save_preds[k].append(v.cpu())
 
             for evaluator in evaluators:
                 evaluator.update_batch(batch, preds)
 
             del carry, loss, preds, batch, all_finish
 
-            # Aggregate metrics
             set_id = set_ids[set_name]
 
             if metric_values is None:
-                metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros(
-                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
-                )
+                metric_keys = list(sorted(metrics.keys()))
+                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
-
             del metrics
 
-        # concatenate save preds
         save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
 
-        # Save preds
         if config.checkpoint_path is not None and len(save_preds):
-            # Each rank save predictions independently
             os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
             torch.save(
                 save_preds,
@@ -613,27 +600,24 @@ def evaluate(
 
         del save_preds
 
-        # Reduce to rank 0
         if metric_values is not None:
             if world_size > 1:
                 dist.reduce(metric_values, dst=0)
 
             if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
+                reduced_metrics_np = metric_values.cpu().numpy()
                 reduced_metrics = {
                     set_name: {
-                        metric_name: reduced_metrics[set_id, metric_id]
+                        metric_name: reduced_metrics_np[set_id, metric_id]
                         for metric_id, metric_name in enumerate(metric_keys)
                     }
                     for set_id, set_name in enumerate(set_ids)
                 }
 
-                # Postprocess
                 for set_name, m in reduced_metrics.items():
                     count = m.pop("count")
                     reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
 
-        # Run evaluators
         if rank == 0:
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
 
@@ -641,7 +625,6 @@ def evaluate(
             if rank == 0:
                 print(f"Running evaluator {i+1}/{len(evaluators)}: {evaluator.__class__.__name__}")
 
-            # Path for saving
             evaluator_save_path = None
             if config.checkpoint_path is not None:
                 evaluator_save_path = os.path.join(
@@ -650,14 +633,10 @@ def evaluate(
                 )
                 os.makedirs(evaluator_save_path, exist_ok=True)
 
-            # Run and log
-            metrics = evaluator.result(
-                evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group
-            )
+            metrics = evaluator.result(evaluator_save_path, rank=rank, world_size=world_size, group=cpu_group)
             if rank == 0 and metrics is not None:
                 if reduced_metrics is None:
                     reduced_metrics = {}
-
                 reduced_metrics.update(metrics)
                 print(f"  Completed {evaluator.__class__.__name__}")
 
@@ -673,7 +652,6 @@ def save_code_and_config(config: PretrainConfig):
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
 
-    # Copy code
     code_list = [
         get_model_source_path(config.arch.name),
         get_model_source_path(config.arch.loss.name),
@@ -681,15 +659,12 @@ def save_code_and_config(config: PretrainConfig):
     for code_file in code_list:
         if code_file is not None:
             code_name = os.path.basename(code_file)
-
             shutil.copy(code_file, os.path.join(config.checkpoint_path, code_name))
 
-    # Dump config as yaml
     config_file = os.path.join(config.checkpoint_path, "all_config.yaml")
     with open(config_file, "wt") as f:
         yaml.dump(config.model_dump(), f)
 
-    # Log code
     wandb.run.log_code(config.checkpoint_path)
 
 
@@ -698,7 +673,6 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     if rank == 0:
         config = PretrainConfig(**hydra_config)  # type: ignore
 
-        # Naming
         if config.project_name is None:
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
         if config.run_name is None:
@@ -720,9 +694,7 @@ def launch(hydra_config: DictConfig):
     WORLD_SIZE = 1
     CPU_PROCESS_GROUP = None
 
-    # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
-        # Initialize distributed, default device and dtype
         dist.init_process_group(backend="nccl")
 
         RANK = dist.get_rank()
@@ -730,20 +702,13 @@ def launch(hydra_config: DictConfig):
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-        # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
-        assert (
-            dist.get_rank(CPU_PROCESS_GROUP) == RANK
-            and dist.get_world_size(CPU_PROCESS_GROUP) == WORLD_SIZE
-        )
+        assert dist.get_rank(CPU_PROCESS_GROUP) == RANK and dist.get_world_size(CPU_PROCESS_GROUP) == WORLD_SIZE
 
-    # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
-    # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
-    # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
     total_iters = config.epochs // train_epochs_per_iter
 
@@ -778,10 +743,8 @@ def launch(hydra_config: DictConfig):
         print("No evaluator found")
         evaluators = []
 
-    # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
-    # Progress bar and logger
     progress_bar = None
     ema_helper = None
     if RANK == 0:
@@ -794,20 +757,19 @@ def launch(hydra_config: DictConfig):
         )  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
+
     if config.ema:
         print("Setup EMA")
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
-    # Training Loop
     for _iter_id in range(total_iters):
         print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
-        ############ Train Iter
         if RANK == 0:
             print("TRAIN")
         train_state.model.train()
-        for set_name, batch, global_batch_size in train_loader:
+        for _set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(
                 config,
                 train_state,
@@ -820,19 +782,21 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+
             if config.ema:
                 ema_helper.update(train_state.model)
 
         if _iter_id >= config.min_eval_interval:
-            ############ Evaluation
             if RANK == 0:
                 print("EVALUATE")
+
             if config.ema:
                 print("SWITCH TO EMA")
                 train_state_eval = copy.deepcopy(train_state)
                 train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
             else:
                 train_state_eval = train_state
+
             train_state_eval.model.eval()
             metrics = evaluate(
                 config,
@@ -848,7 +812,6 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
 
-            ############ Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
@@ -857,7 +820,6 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 del train_state_eval
 
-    # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
     wandb.finish()
