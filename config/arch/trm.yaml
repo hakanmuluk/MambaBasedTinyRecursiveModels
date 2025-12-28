@@ -27,12 +27,22 @@ no_ACT_continue: True
 
 # 🔹 Mamba hyperparameters
 mamba_d_state: 64
-mamba_d_conv: 4
-mamba_expand: 2.0
+mamba_d_conv: 1
+mamba_expand: 4.0
 mamba_dt_rank: auto
 
 # 🔹 Our modes (exactly one of these should be true)
-mamba_bimamba_v2_with_transformer: True
+mamba_bimamba_v2_with_transformer: False
+mamba_bimamba_with_transformer_and_nn: False
 mamba_two_stage: False          # disable old two-stage design
 mamba_bimamba_v2: False          # enable new BiMamba v2 block
 mamba_if_divide_out: True       # match Vision Mamba's /2 behavior
+
+mamba_bimamba_heads_transformer_nn: False
+mamba_bimamba_heads: 8
+mamba_bimamba_heads_out_proj: True  # optional mixing after concat (adds params)
+
+bilstm_with_nn: True
+bilstm_hidden_size: 512      # 0 => use hidden_size (per direction)
+bilstm_num_layers: 1
+bilstm_downproj_bias: False
