@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
-
 from torch import nn
 from pydantic import BaseModel
 import random
@@ -40,10 +39,8 @@ class TinyRecursiveReasoningModel_ACTV1InnerCarry:
 @dataclass
 class TinyRecursiveReasoningModel_ACTV1Carry:
     inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
-
     steps: torch.Tensor
     halted: torch.Tensor
-
     current_data: Dict[str, torch.Tensor]
 
 
@@ -90,9 +87,20 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mamba_bimamba_v2_with_transformer: bool = False  # BiMambaV2 then self-attn then FFN
     mamba_bimamba_with_transformer_and_nn: bool = False
 
+    # NEW: Multi-head BiMamba (like attention heads) + mid-MLP + self-attn + final MLP
+    mamba_bimamba_heads_transformer_nn: bool = False
+    mamba_bimamba_heads: int = 4
+    mamba_bimamba_heads_out_proj: bool = True  # optional mixing after concat (adds params)
 
     mamba_bimamba_v2: bool = False       # if True → use BiMamba v2 block
     mamba_if_divide_out: bool = True     # match Vision Mamba's /2 behavior
+
+    # 🔹 BiLSTM option (per-layer): BiLSTM -> downproj -> (final SwiGLU MLP)
+    bilstm_with_nn: bool = True
+    bilstm_hidden_size: int = 0      # 0 => use hidden_size (per direction)
+    bilstm_num_layers: int = 1
+    bilstm_downproj_bias: bool = False
+
 
 
 class BiMambaV2(nn.Module):
@@ -164,15 +172,11 @@ class BiMambaV2(nn.Module):
         self.act = nn.SiLU()
 
         # Projections for dt, B, C (forward)
-        self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Projections for dt, B, C (backward)
-        self.x_proj_b = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
+        self.x_proj_b = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
         self.dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Initialize dt_proj like Vision Mamba
@@ -255,14 +259,14 @@ class BiMambaV2(nn.Module):
         dt, B_, C_ = torch.split(x_dbl, [self.dt_rank, d_state, d_state], dim=-1)
 
         # dt: [B*L, dt_rank] -> [B*L, d_inner] -> [B, d_inner, L]
-        dt = dt_proj(dt)                                   # (B*L, d_inner)
+        dt = dt_proj(dt)
         dt = rearrange(dt, "(b l) d -> b d l", b=Bsz, l=L)
 
         # B, C: [B, d_state, L]
         B_ = rearrange(B_, "(b l) n -> b n l", b=Bsz, l=L).contiguous()
         C_ = rearrange(C_, "(b l) n -> b n l", b=Bsz, l=L).contiguous()
 
-        A = -torch.exp(A_log.float())                      # (d_inner, d_state)
+        A = -torch.exp(A_log.float())
 
         y = selective_scan_fn(
             x_conv,
@@ -275,7 +279,7 @@ class BiMambaV2(nn.Module):
             delta_bias=dt_proj.bias.float(),
             delta_softplus=True,
             return_last_state=False,
-        )  # (B, d_inner, L)
+        )
 
         return y
 
@@ -291,12 +295,12 @@ class BiMambaV2(nn.Module):
         assert D == self.d_model
 
         # In-projection: [B, L, D] -> [B, L, 2*d_inner] -> [B, 2*d_inner, L]
-        xz = self.in_proj(hidden_states)                    # (B, L, 2*d_inner)
-        xz = rearrange(xz, "b l d2 -> b d2 l")              # (B, 2*d_inner, L)
-        x, z = xz.chunk(2, dim=1)                           # (B, d_inner, L) each
+        xz = self.in_proj(hidden_states)
+        xz = rearrange(xz, "b l d2 -> b d2 l")
+        x, z = xz.chunk(2, dim=1)
 
         # ----- FORWARD DIRECTION -----
-        x_conv_f = self.conv1d(x)[..., :L]                  # (B, d_inner, L)
+        x_conv_f = self.conv1d(x)[..., :L]
         y_f = self._ssm_pass(
             x_conv=x_conv_f,
             z=z,
@@ -304,12 +308,11 @@ class BiMambaV2(nn.Module):
             x_proj=self.x_proj,
             dt_proj=self.dt_proj,
             D=self.D,
-        )                                                   # (B, d_inner, L)
+        )
 
         # ----- BACKWARD DIRECTION -----
-        # flip seq -> conv -> SSM -> flip back
         x_b, z_b = x.flip(-1), z.flip(-1)
-        x_conv_b = self.conv1d_b(x_b)[..., :L]              # (B, d_inner, L)
+        x_conv_b = self.conv1d_b(x_b)[..., :L]
         y_b = self._ssm_pass(
             x_conv=x_conv_b,
             z=z_b,
@@ -317,14 +320,14 @@ class BiMambaV2(nn.Module):
             x_proj=self.x_proj_b,
             dt_proj=self.dt_proj_b,
             D=self.D_b,
-        )                                                   # (B, d_inner, L)
+        )
         y_b = y_b.flip(-1)
 
         # Combine directions
         if self.if_divide_out:
             y = (y_f + y_b) / 2.0
         else:
-            y = y_f + y_b                                   # (B, d_inner, L)
+            y = y_f + y_b
 
         # Final projection to d_model
         y = rearrange(y, "b d l -> b l d")
@@ -335,6 +338,71 @@ class BiMambaV2(nn.Module):
 
         return out
 
+
+class MultiHeadBiMambaV2(nn.Module):
+    """
+    Multi-head BiMambaV2:
+      - Split hidden dim D into H heads (D_head = D/H)
+      - Run independent BiMambaV2 per head
+      - Concat back to (B, L, D)
+      - Optional output projection to mix heads (like attention's o_proj)
+    """
+    def __init__(
+        self,
+        d_model: int,
+        heads: int,
+        d_state: int,
+        d_conv: int,
+        expand: float,
+        dt_rank: int | str,
+        if_divide_out: bool,
+        dtype,
+        use_out_proj: bool = True,
+    ) -> None:
+        super().__init__()
+        assert heads > 0
+        if d_model % heads != 0:
+            raise ValueError(f"hidden_size ({d_model}) must be divisible by mamba_bimamba_heads ({heads})")
+        self.d_model = d_model
+        self.heads = heads
+        self.d_head = d_model // heads
+        self.use_out_proj = use_out_proj
+
+        self.mambas = nn.ModuleList(
+            [
+                BiMambaV2(
+                    d_model=self.d_head,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    dt_rank=dt_rank,
+                    device=None,
+                    dtype=dtype,
+                    if_divide_out=if_divide_out,
+                )
+                for _ in range(heads)
+            ]
+        )
+
+        if self.use_out_proj:
+            self.out_proj = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        else:
+            self.out_proj = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states: (B, L, D)
+        B, L, D = hidden_states.shape
+        assert D == self.d_model
+
+        chunks = torch.chunk(hidden_states, self.heads, dim=-1)  # tuple of (B, L, d_head)
+        outs = []
+        for m, xh in zip(self.mambas, chunks):
+            outs.append(m(xh.contiguous()))
+        y = torch.cat(outs, dim=-1)  # (B, L, D)
+
+        if self.out_proj is not None:
+            y = self.out_proj(y)
+        return y
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -348,6 +416,10 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         # Decide mode
         if self.config.mlp_t:
             self.mode = "mlp_t"
+        elif self.config.bilstm_with_nn:
+            self.mode = "bilstm_with_nn"
+        elif self.config.mamba_bimamba_heads_transformer_nn:
+            self.mode = "bimamba_heads_transformer_nn"
         elif self.config.mamba_bimamba_v2_with_transformer:
             self.mode = "bimamba_v2_with_transformer"
         elif self.config.mamba_bimamba_v2:
@@ -358,7 +430,6 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             self.mode = "mamba_two_stage"
         else:
             self.mode = "simple_mamba"
-
 
         # ------------------------------------------------------------------
         # 1) mlp_t mode (original TRM)
@@ -379,8 +450,73 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             self.dir_fwd = None
             self.dir_bwd = None
 
+
+        elif self.mode == "bilstm_with_nn":
+            self.mlp_t = None
+            self.mamba = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+
+            # per-direction hidden size
+            h = config.hidden_size if getattr(config, "bilstm_hidden_size", 0) in (0, None) else config.bilstm_hidden_size
+
+            # NOTE: LSTM kernels can be picky with bf16 on some setups.
+            # Safest: keep LSTM weights in fp32 and cast inputs/outputs in forward.
+            self.bilstm = nn.LSTM(
+                input_size=config.hidden_size,
+                hidden_size=h,
+                num_layers=config.bilstm_num_layers,
+                bidirectional=True,
+                batch_first=True,
+            )
+
+            # BiLSTM output is 2*h; we down-project to hidden_size
+            self.bilstm_downproj = nn.Linear(
+                2 * h,
+                config.hidden_size,
+                bias=config.bilstm_downproj_bias,
+            )
+
+
         # ------------------------------------------------------------------
-        # 2) NEW: BiMamba v2 mode (one block, v2 SSMs inside)
+        # 2) NEW: Multi-head BiMamba + mid-MLP + Transformer self-attn
+        # ------------------------------------------------------------------
+        elif self.mode == "bimamba_heads_transformer_nn":
+            self.mlp_t = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+
+            self.mamba = MultiHeadBiMambaV2(
+                d_model=config.hidden_size,
+                heads=config.mamba_bimamba_heads,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                if_divide_out=config.mamba_if_divide_out,
+                dtype=self.forward_dtype,
+                use_out_proj=config.mamba_bimamba_heads_out_proj,
+            )
+
+            self.mlp_mid = SwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
+
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False,
+            )
+
+        # ------------------------------------------------------------------
+        # 2a) BiMamba v2 mode (one block, v2 SSMs inside)
         # ------------------------------------------------------------------
         elif self.mode == "bimamba_v2":
             self.mlp_t = None
@@ -400,13 +536,16 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 if_divide_out=self.config.mamba_if_divide_out,
             )
 
+        # ------------------------------------------------------------------
+        # 2b) BiMamba v2 + mid MLP + Transformer self-attn (single BiMamba)
+        # ------------------------------------------------------------------
         elif self.mode == "bimamba_with_transformer_and_nn":
             self.mlp_t = None
             self.mamba_first = None
             self.mamba_second = None
             self.dir_fwd = None
             self.dir_bwd = None
-        
+
             self.mamba = BiMambaV2(
                 d_model=config.hidden_size,
                 d_state=config.mamba_d_state,
@@ -417,14 +556,12 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 dtype=self.forward_dtype,
                 if_divide_out=self.config.mamba_if_divide_out,
             )
-        
-            # MLP between BiMamba and Transformer
+
             self.mlp_mid = SwiGLU(
                 hidden_size=config.hidden_size,
                 expansion=config.expansion,
             )
-        
-            # Transformer self-attention
+
             self.self_attn = Attention(
                 hidden_size=config.hidden_size,
                 head_dim=config.hidden_size // config.num_heads,
@@ -434,7 +571,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             )
 
         # ------------------------------------------------------------------
-        # 2b) NEW: BiMamba v2 + Transformer (self-attn) in the same layer
+        # 2c) BiMamba v2 + Transformer (self-attn) in the same layer
         # ------------------------------------------------------------------
         elif self.mode == "bimamba_v2_with_transformer":
             self.mlp_t = None
@@ -461,7 +598,6 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=False,
             )
-
 
         # ------------------------------------------------------------------
         # 3) Two-stage Mamba (your previous design)
@@ -502,8 +638,6 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
 
             self.mamba = None
 
-
-
         # ------------------------------------------------------------------
         # 4) Default: single shared Mamba + manual bi-direction via flip
         # ------------------------------------------------------------------
@@ -532,7 +666,6 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         )
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # cos_sin is currently unused in the Mamba paths
         # hidden_states: [B, L, D]
 
         # ---------------- mlp_t ----------------
@@ -542,13 +675,48 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
             hidden_states = hidden_states.transpose(1, 2)  # [B, L, D]
 
-        # ---------------- BiMamba v2 (new) ----------------
+
+        elif self.mode == "bilstm_with_nn":
+            # Author-style post-norm residual around the recurrent module.
+            # BiLSTM expects (B, L, D) already since batch_first=True.
+
+            x = hidden_states.contiguous()
+
+            # Run LSTM in fp32 for stability/compatibility; then project back and cast.
+            lstm_out, _ = self.bilstm(x.to(torch.float32))                 # (B, L, 2*h)
+            proj = self.bilstm_downproj(lstm_out)                          # (B, L, D)
+            proj = proj.to(x.dtype)
+
+            hidden_states = rms_norm(x + proj, variance_epsilon=self.norm_eps)
+
+
+        # ---------------- Multi-head BiMamba + mid-MLP + self-attn ----------------
+        elif self.mode == "bimamba_heads_transformer_nn":
+            hidden_states = hidden_states.contiguous()
+
+            # (1) Multi-head BiMamba (post-norm, author style)
+            hidden_states = rms_norm(
+                hidden_states + self.mamba(hidden_states),
+                variance_epsilon=self.norm_eps
+            )
+
+            # (2) mid MLP (post-norm)
+            hidden_states = rms_norm(
+                hidden_states + self.mlp_mid(hidden_states),
+                variance_epsilon=self.norm_eps
+            )
+
+            # (3) self-attn (EXACT author pattern)
+            hidden_states = rms_norm(
+                hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+                variance_epsilon=self.norm_eps
+            )
+
+        # ---------------- BiMamba v2 (single) ----------------
         elif self.mode == "bimamba_v2":
             x = hidden_states.contiguous()
-            y = self.mamba(x)  # BiMambaV2 forward
+            y = self.mamba(x)
             hidden_states = rms_norm(x + y, variance_epsilon=self.norm_eps)
-
-
 
         elif self.mode == "bimamba_with_transformer_and_nn":
             x = hidden_states.contiguous()
