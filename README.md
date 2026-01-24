@@ -302,7 +302,7 @@ ema=True \
 
 
 
-run_name="bimamba_v2_dropout_less"
+run_name="bimamba_v2_dropout_less_bias_and_comb_fixed"
 
 python pretrain.py \
 arch=trm \
