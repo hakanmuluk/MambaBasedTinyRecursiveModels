@@ -336,7 +336,7 @@ ema=True \
 
 
 
-run_name="bimamba_v2_gating"
+run_name="bimamba_v2_gating_input_masked_loss"
 python pretrain.py \
 arch=trm \
 data_paths="[data/sudoku-extreme-1k-aug-1000]" \
@@ -345,24 +345,23 @@ evaluators="[]" \
 global_batch_size=384 \
 epochs=30000 \
 eval_interval=3000 \
-lr=3e-5 \
-lr_mamba=3e-5 \
+lr=1e-4 \
+lr_mamba=1e-4 \
 lr_min_ratio=0.2 \
 lr_warmup_steps=2500 \
-weight_decay=0.1 \
-puzzle_emb_lr=3e-5 \
-puzzle_emb_weight_decay=0.1 \
+weight_decay=0.05 \
+puzzle_emb_lr=1e-4 \
+puzzle_emb_weight_decay=0.05 \
 arch.L_layers=2 \
 arch.H_cycles=3 arch.L_cycles=6 \
 arch.mlp_t=False \
 arch.state_dep_dual_mamba=False \
-arch.mamba_bimamba_v2_dropout=True \
-arch.mamba_bimamba_v2=False \
+arch.mamba_bimamba_v2_dropout=False \
+arch.mamba_bimamba_v2=True \
 arch.mamba_bimamba_v2_with_transformer=False \
 arch.mamba_bimamba_with_transformer_and_nn=False \
 arch.mamba_two_stage=False \
 arch.bilstm_with_nn=False \
-arch.mamba_dropout_p=0.0 \
 ema=True \
 +run_name=${run_name}
 
