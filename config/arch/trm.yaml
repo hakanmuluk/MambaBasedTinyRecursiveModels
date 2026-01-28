@@ -13,7 +13,7 @@ H_layers: 0
 L_layers: 2
 
 hidden_size: 512
-num_heads: 8        # still used for RoPE dim split etc., though attention is replaced
+num_heads: 8
 expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}
@@ -21,28 +21,52 @@ puzzle_emb_ndim: ${.hidden_size}
 pos_encodings: rope
 forward_dtype: bfloat16
 
-mlp_t: False        # use mamba (not mlp_t) on L
-puzzle_emb_len: 16
+mlp_t: False
+puzzle_emb_len: 1
 no_ACT_continue: True
 
-# 🔹 Mamba hyperparameters
+# ----------------------------
+# Dropout (NEW)
+# ----------------------------
+# If you implement the "bimamba_v2_dropout" mode, use these:
+mamba_dropout_p: 0.10          # single knob (recommended)
+# OR, if you implement separate knobs instead:
+# resid_drop: 0.10       # dropout on residual branches (mamba/attn)
+# mlp_drop: 0.10         # dropout on MLP branch
+
+# ----------------------------
+# Mamba hyperparameters
+# ----------------------------
 mamba_d_state: 64
 mamba_d_conv: 1
 mamba_expand: 4.0
 mamba_dt_rank: auto
 
-# 🔹 Our modes (exactly one of these should be true)
+# ----------------------------
+# Modes (exactly one should be true)
+# ----------------------------
 mamba_bimamba_v2_with_transformer: False
 mamba_bimamba_with_transformer_and_nn: False
-mamba_two_stage: False          # disable old two-stage design
-mamba_bimamba_v2: False          # enable new BiMamba v2 block
-mamba_if_divide_out: True       # match Vision Mamba's /2 behavior
+mamba_two_stage: False
+mamba_bimamba_v2: False
+
+# NEW mode you asked for
+mamba_bimamba_v2_dropout: True
+
+mamba_if_divide_out: True
 
 mamba_bimamba_heads_transformer_nn: False
 mamba_bimamba_heads: 8
-mamba_bimamba_heads_out_proj: True  # optional mixing after concat (adds params)
+mamba_bimamba_heads_out_proj: True
 
-bilstm_with_nn: True
-bilstm_hidden_size: 512      # 0 => use hidden_size (per direction)
+# Turn this OFF since we're switching to bimamba_v2_dropout
+state_dep_dual_mamba: False
+
+bilstm_with_nn: False
+bilstm_hidden_size: 512
 bilstm_num_layers: 1
 bilstm_downproj_bias: False
+
+
+
+

@@ -7,6 +7,14 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
+import math
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
 from torch import nn
 from pydantic import BaseModel
 import random
@@ -93,13 +101,18 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mamba_bimamba_heads_out_proj: bool = True  # optional mixing after concat (adds params)
 
     mamba_bimamba_v2: bool = False       # if True → use BiMamba v2 block
+    mamba_bimamba_v2_dropout: bool = True  # NEW: BiMamba v2 + dropout on residual branch
+    mamba_dropout_p: float = 0.1            # NEW: dropout prob
+
     mamba_if_divide_out: bool = True     # match Vision Mamba's /2 behavior
+    state_dep_dual_mamba: bool = False
 
     # 🔹 BiLSTM option (per-layer): BiLSTM -> downproj -> (final SwiGLU MLP)
     bilstm_with_nn: bool = True
     bilstm_hidden_size: int = 0      # 0 => use hidden_size (per direction)
     bilstm_num_layers: int = 1
     bilstm_downproj_bias: bool = False
+
 
 
 
@@ -405,6 +418,199 @@ class MultiHeadBiMambaV2(nn.Module):
         return y
 
 
+
+
+
+class state_dependent_mamba(nn.Module):
+    """
+    State-dependent Mamba (pure PyTorch):
+      Δ_t depends on running SSM state h_{t-1} (channelwise).
+
+    BF16-friendly version:
+      - Activations / run_state / y_out are bf16 (low memory)
+      - softplus + exp discretization are computed in fp32 for stability
+      - A_log, D, dt_state_weight stored in fp32 as "master params"
+
+    Notes:
+      - Still slower than fused selective_scan.
+      - This is the "best effort" bf16 version without writing a custom fused kernel.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: float = 2.0,
+        dt_rank: int | str = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        conv_bias: bool = True,
+        layer_idx=None,  # signature compat; unused
+        device=None,
+        dtype=None,      # pass torch.bfloat16 if you want weights in bf16
+    ) -> None:
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else int(dt_rank)
+
+        bias = False  # match original Mamba style
+
+        # (These weights can be bf16 if dtype=torch.bfloat16)
+        self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=bias, **factory_kwargs)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+
+        self.act = nn.SiLU()
+
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False, **factory_kwargs)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        # dt_proj init
+        dt_init_std = self.dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError
+
+        # dt bias init so softplus(dt_bias) in [dt_min, dt_max]
+        dt = torch.exp(
+            torch.rand(self.d_inner, device=device, dtype=torch.float32)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt.to(self.dt_proj.bias.dtype))
+        self.dt_proj.bias._no_reinit = True
+        self.dt_proj.bias._no_weight_decay = True
+
+        # --- fp32 master params (keep stable) ---
+        A = repeat(
+            torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        self.A_log = nn.Parameter(torch.log(A))  # fp32
+        self.A_log._no_weight_decay = True
+
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device, dtype=torch.float32))  # fp32
+        self.D._no_weight_decay = True
+
+        self.dt_state_weight = nn.Parameter(
+            torch.zeros(self.d_inner, d_state, device=device, dtype=torch.float32)  # fp32
+        )
+        nn.init.normal_(self.dt_state_weight, mean=0.0, std=1e-3)
+
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=bias, **factory_kwargs)
+
+    def _state_term(self, run_state_bf16: torch.Tensor) -> torch.Tensor:
+        """
+        run_state_bf16: (B, d_inner, d_state) bf16
+        returns:        (B, d_inner) bf16
+
+        We compute tanh + projection in fp32, then cast back to bf16.
+        """
+        h_fp32 = torch.tanh(run_state_bf16.float())  # (B,d_inner,d_state) fp32
+        st_fp32 = torch.einsum("bdn,dn->bd", h_fp32, self.dt_state_weight)  # fp32
+        return st_fp32.to(run_state_bf16.dtype)  # bf16
+
+    def forward(self, hidden_states: torch.Tensor, inference_params=None) -> torch.Tensor:
+        if inference_params is not None:
+            raise NotImplementedError("state_dependent_mamba: inference cache not implemented.")
+
+        B, L, D = hidden_states.shape
+        assert D == self.d_model
+
+        # We expect bf16 model usage, but this will also work for fp16/fp32.
+        model_dtype = hidden_states.dtype
+        device = hidden_states.device
+
+        # in_proj: (B,L,D) -> (B,2*d_inner,L)
+        xz = self.in_proj(hidden_states)
+        xz = rearrange(xz, "b l d2 -> b d2 l")
+        x, z = xz.chunk(2, dim=1)  # (B,d_inner,L)
+
+        # conv + silu in model dtype
+        x = self.conv1d(x)[..., :L]
+        x = self.act(x)
+
+        # token-conditioned dt,B,C in model dtype
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        dt_raw, B_raw, C_raw = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+
+        dt_linear = self.dt_proj(dt_raw)  # (B*L,d_inner) model dtype
+        dt_linear = rearrange(dt_linear, "(b l) d -> b d l", b=B, l=L)
+
+        B_seq = rearrange(B_raw, "(b l) n -> b n l", b=B, l=L).contiguous()
+        C_seq = rearrange(C_raw, "(b l) n -> b n l", b=B, l=L).contiguous()
+
+        # --- prepare fp32 constants ---
+        A_fp32 = -torch.exp(self.A_log)               # (d_inner,d_state) fp32
+        dt_bias_fp32 = self.dt_proj.bias.float()      # (d_inner,) fp32
+        Dskip_fp32 = self.D                           # (d_inner,) fp32
+
+        # --- bf16 recurrent state (memory saver) ---
+        run_state = torch.zeros(B, self.d_inner, self.d_state, device=device, dtype=model_dtype)
+
+        # output buffer in bf16
+        y_out = torch.empty(B, L, self.d_inner, device=device, dtype=model_dtype)
+
+        for t in range(L):
+            u_t = x[:, :, t]          # (B,d_inner) bf16
+            z_t = z[:, :, t]          # (B,d_inner) bf16
+            B_t = B_seq[:, :, t]      # (B,d_state) bf16
+            C_t = C_seq[:, :, t]      # (B,d_state) bf16
+
+            st = self._state_term(run_state)          # bf16
+
+            # dt_eff computed in fp32 for stability
+            dt_eff_fp32 = F.softplus(
+                dt_linear[:, :, t].float()
+                #+ dt_bias_fp32.unsqueeze(0)
+                + st.float()
+            )  # (B,d_inner) fp32
+
+            # discretization in fp32, then cast to bf16 for state update
+            # e = dt_eff * A  -> (B,d_inner,d_state)
+            e_fp32 = torch.einsum("bd,dn->bdn", dt_eff_fp32, A_fp32)
+            dA = torch.exp(e_fp32).to(model_dtype)  # bf16
+
+            dB_fp32 = torch.einsum("bd,bn->bdn", dt_eff_fp32, B_t.float())
+            dB = dB_fp32.to(model_dtype)            # bf16
+
+            # state update in bf16
+            run_state = run_state * dA + u_t.unsqueeze(-1) * dB
+
+            # output: do the reduction in fp32, then cast back
+            y_t_fp32 = torch.einsum("bdn,bn->bd", run_state.float(), C_t.float()) + Dskip_fp32.unsqueeze(0) * u_t.float()
+            y_t_fp32 = y_t_fp32 * self.act(z_t.float())
+            y_out[:, t, :] = y_t_fp32.to(model_dtype)
+
+        return self.out_proj(y_out)
+
+
+
+
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -412,6 +618,8 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         self.config = config
         self.norm_eps = config.rms_norm_eps
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        self.dropout = None
+
 
         # Decide mode
         if self.config.mlp_t:
@@ -422,10 +630,17 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             self.mode = "bimamba_heads_transformer_nn"
         elif self.config.mamba_bimamba_v2_with_transformer:
             self.mode = "bimamba_v2_with_transformer"
+        
+        elif self.config.mamba_bimamba_v2_dropout:     # NEW
+            self.mode = "bimamba_v2_dropout"
+
+
         elif self.config.mamba_bimamba_v2:
             self.mode = "bimamba_v2"
         elif self.config.mamba_bimamba_with_transformer_and_nn:
             self.mode = "bimamba_with_transformer_and_nn"
+        elif self.config.state_dep_dual_mamba:
+            self.mode = "state_dep_dual_mamba"
         elif self.config.mamba_two_stage:
             self.mode = "mamba_two_stage"
         else:
@@ -449,6 +664,51 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             self.mamba_second = None
             self.dir_fwd = None
             self.dir_bwd = None
+
+        elif self.mode == "bimamba_v2_dropout":
+            print("GATING")
+            self.mlp_t = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+
+            self.mamba = BiMambaV2(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                device=None,
+                dtype=self.forward_dtype,
+                if_divide_out=self.config.mamba_if_divide_out,
+            )
+
+            self.dropout = nn.Dropout(p=getattr(config, "mamba_dropout_p", 0.1))
+
+            # ------------------------------------------------------------
+            # NEW: gated residual for BiMambaV2 (conditioned on [x; Δ])
+            #   α(x,Δ): tokenwise scalar (B,L,1) via 2-layer MLP
+            #   m(x,Δ): tokenwise-channel mask (B,L,D) via 1-layer
+            # ------------------------------------------------------------
+            """ D = config.hidden_size
+            H = D // 2  # gate hidden width (you can change to D//4 or D)
+
+            self.gate_act = nn.SiLU()
+
+            # α MLP: (2D -> H -> 1)
+            self.alpha_fc1 = nn.Linear(2 * D, H, bias=True, dtype=self.forward_dtype)
+            self.alpha_fc2 = nn.Linear(H, 1, bias=True, dtype=self.forward_dtype)
+
+            # mask: (2D -> D)
+            self.mask_fc = nn.Linear(2 * D, D, bias=True, dtype=self.forward_dtype)
+
+            # Init: start mostly closed so TRM steps don't thrash
+            with torch.no_grad():
+                # Make alpha initially small: sigmoid(-2) ≈ 0.12
+                self.alpha_fc2.bias.fill_(-2.0)
+                # Make mask initially small-ish too
+                self.mask_fc.bias.fill_(-2.0) """
 
 
         elif self.mode == "bilstm_with_nn":
@@ -536,6 +796,10 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 if_divide_out=self.config.mamba_if_divide_out,
             )
 
+    
+
+
+
         # ------------------------------------------------------------------
         # 2b) BiMamba v2 + mid MLP + Transformer self-attn (single BiMamba)
         # ------------------------------------------------------------------
@@ -569,6 +833,44 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=False,
             )
+
+        # ------------------------------------------------------------------
+        # 2d) State-dependent dual Mamba (forward/backward) + downproj
+        # ------------------------------------------------------------------
+        elif self.mode == "state_dep_dual_mamba":
+            self.mlp_t = None
+            self.mamba_first = None
+            self.mamba_second = None
+            self.dir_fwd = None
+            self.dir_bwd = None
+            self.mamba = None
+
+            self.state_dep_fwd = state_dependent_mamba(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                device=None,
+                dtype=self.forward_dtype,
+            )
+            self.state_dep_bwd = state_dependent_mamba(
+                d_model=config.hidden_size,
+                d_state=config.mamba_d_state,
+                d_conv=config.mamba_d_conv,
+                expand=config.mamba_expand,
+                dt_rank=config.mamba_dt_rank,
+                device=None,
+                dtype=self.forward_dtype,
+            )
+            self.state_dep_downproj = nn.Linear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                dtype=self.forward_dtype,
+            )
+            self.dropout = nn.Dropout(p=getattr(config, "mamba_dropout_p", 0.1))
+
 
         # ------------------------------------------------------------------
         # 2c) BiMamba v2 + Transformer (self-attn) in the same layer
@@ -665,6 +967,30 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             expansion=config.expansion,
         )
 
+
+
+
+
+    def _apply_bimamba_v2_dropout_gates(self, x: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """
+        x:     (B, L, D)
+        delta: (B, L, D)  proposed update from BiMambaV2
+
+        Returns gated_delta: (B, L, D) = α(x,delta) * (m(x,delta) ⊙ delta)
+        with α tokenwise scalar (B,L,1), m tokenwise-channel (B,L,D).
+        """
+        u = torch.cat([x, delta], dim=-1)  # (B, L, 2D)
+
+        # α: 2-layer MLP -> sigmoid -> (B,L,1)
+        h = self.gate_act(self.alpha_fc1(u))  # (B,L,H)
+        alpha = torch.sigmoid(self.alpha_fc2(h).float()).to(x.dtype)  # (B,L,1)
+
+        # m: 1-layer -> sigmoid -> (B,L,D)
+        mask = torch.sigmoid(self.mask_fc(u).float()).to(x.dtype)  # (B,L,D)
+
+        return alpha * (mask * delta)
+
+
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: [B, L, D]
 
@@ -674,6 +1000,20 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             out = self.mlp_t(hidden_states)
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
             hidden_states = hidden_states.transpose(1, 2)  # [B, L, D]
+
+        # ---------------- BiMamba v2 + dropout ----------------
+        elif self.mode == "bimamba_v2_dropout": 
+            x = hidden_states.contiguous()
+            delta = self.mamba(x)  # proposed update Δ
+
+            # Apply α(x,Δ) and m(x,Δ)
+            # y = self._apply_bimamba_v2_dropout_gates(x, delta)
+
+            # Keep your dropout on the residual branch
+            y = self.dropout(delta)
+
+            hidden_states = rms_norm(x + y, variance_epsilon=self.norm_eps)
+
 
 
         elif self.mode == "bilstm_with_nn":
@@ -733,6 +1073,20 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
             hidden_states = rms_norm(hidden_states + attn_out, variance_epsilon=self.norm_eps)
 
+        elif self.mode == "state_dep_dual_mamba":
+            x = hidden_states.contiguous()
+
+            y_fwd = self.state_dep_fwd(x)
+            rev_x = torch.flip(x, dims=[1])
+            y_bwd = self.state_dep_bwd(rev_x)
+            y_bwd = torch.flip(y_bwd, dims=[1])
+
+            y = torch.cat([y_fwd, y_bwd], dim=-1)
+            y = self.state_dep_downproj(y)
+
+            y = self.dropout(y)
+
+            hidden_states = rms_norm(x + y, variance_epsilon=self.norm_eps)
 
         # ---------------- two-stage Mamba ----------------
         elif self.mode == "mamba_two_stage":
@@ -778,9 +1132,11 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             y = 0.5 * (y_fwd + y_bwd)
             hidden_states = rms_norm(hidden_states + y, variance_epsilon=self.norm_eps)
 
-        # final MLP
         out = self.mlp(hidden_states)
+        if self.dropout is not None:
+            out = self.dropout(out)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+
 
         return hidden_states
 

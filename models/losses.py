@@ -32,10 +32,18 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask
     return -torch.where(valid_mask, prediction_logprobs, 0)
 
 
-def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
-    # Cast logits to f32
-    # Flatten logits
-    return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+def softmax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
+    # If a valid_mask is provided, convert non-valid positions to ignore_index
+    if valid_mask is not None:
+        labels = labels.clone()
+        labels[~valid_mask] = ignore_index
+
+    return F.cross_entropy(
+        logits.to(torch.float32).view(-1, logits.shape[-1]),
+        labels.to(torch.long).view(-1),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view(labels.shape)
 
 
 class ACTLossHead(nn.Module):
@@ -57,34 +65,52 @@ class ACTLossHead(nn.Module):
         # B x SeqLen x D
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
-
+        inputs = new_carry.current_data["inputs"]
+        
+        BLANK_TOKEN_ID = 1  # build_sudoku_dataset.py does arr+1, so blank(0)->1
+        
         with torch.no_grad():
             # Preds
-            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
-
-            # Correctness
-            mask = (labels != IGNORE_LABEL_ID)
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
-
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
-            
+            preds = torch.argmax(outputs["logits"], dim=-1)
+            outputs["preds"] = preds
+        
+            # Only evaluate on blanks (ignore given cells)
+            mask = (inputs == BLANK_TOKEN_ID)  # True where model must predict
+        
+            # counts per example
+            loss_counts = mask.sum(-1)  # (B,)
+            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # (B,1)
+        
+            # correctness on blanks only
+            is_correct = mask & (preds == labels)  # (B,L)
+            seq_is_correct = (is_correct.sum(-1) == loss_counts)   # (B,)
+        
             # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
+            valid_metrics = new_carry.halted  # keep your halted gating
             metrics = {
                 "count": valid_metrics.sum(),
-                
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+        
+                # token accuracy over blanks only; if no blanks, contributes 0 (since loss_counts=0 -> valid_metrics still True)
+                "accuracy": torch.where(
+                    valid_metrics,
+                    (is_correct.to(torch.float32) / loss_divisor).sum(-1),
+                    0.0
+                ).sum(),
+        
+                # exact accuracy over blanks only
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-
+        
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
-
-        # Losses
-
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        
+        # Losses (only blanks)
+        lm_loss = (self.loss_fn(
+            outputs["logits"],
+            labels,
+            ignore_index=IGNORE_LABEL_ID,
+            valid_mask=mask,
+        ) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         metrics.update({
             "lm_loss": lm_loss.detach(),

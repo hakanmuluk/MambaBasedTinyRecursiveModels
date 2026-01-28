@@ -1,0 +1,34 @@
+
+# RunPod / training artifacts
+checkpoints/
+outputs/
+wandb/
+data/
+kaggle/
+
+# Python/cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# venv
+.venv/
+venv/
+
+
+# RunPod / training artifacts
+checkpoints/
+outputs/
+wandb/
+data/
+kaggle/
+
+# Python/cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# venv
+.venv/
+venv/
+
