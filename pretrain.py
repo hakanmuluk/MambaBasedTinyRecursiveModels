@@ -532,14 +532,21 @@ def evaluate(
 ):
     reduced_metrics = None
 
+    BLANK_TOKEN_ID = 1  # build_sudoku_dataset.py: blank(0)->1
+
     with torch.inference_mode():
+        # ---------------------------------------------------------
+        # Decide which tensors to return from the model during eval
+        # ---------------------------------------------------------
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
             evaluator.begin_eval()
             return_keys.update(evaluator.required_outputs)
 
-        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
+        # We need per-step preds for corrected/damaged computation
+        return_keys.add("preds")
 
+        set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
         save_preds = {}
 
         metric_keys = []
@@ -554,27 +561,104 @@ def evaluate(
                 print(f"Processing batch {processed_batches}: {set_name}")
 
             batch = {k: v.cuda() for k, v in batch.items()}
+
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
+            # ---------------------------------------------------------
+            # Rollout-level corrected/damaged accumulators for THIS batch
+            # We accumulate per transition (t -> t+1), excluding newly-loaded
+            # examples by only counting examples that were active at t.
+            # ---------------------------------------------------------
+            roll_corr = torch.tensor(0.0, device="cuda")
+            roll_dmg = torch.tensor(0.0, device="cuda")
+            roll_net = torch.tensor(0.0, device="cuda")
+            roll_denom = torch.tensor(0.0, device="cuda")  # #continuing examples summed across transitions
+
+            prev_preds = None
+            prev_carry = None
+
             inference_steps = 0
             while True:
+                prev_carry = carry  # carry BEFORE this step
+
                 carry, loss, metrics, preds, all_finish = train_state.model(
                     carry=carry, batch=batch, return_keys=return_keys
                 )
                 inference_steps += 1
+
+                # ---------------------------------------------------------
+                # Compute corrected/damaged for this transition (prev -> cur)
+                # ---------------------------------------------------------
+                cur_preds = preds.get("preds", None)
+
+                if (
+                    prev_preds is not None
+                    and cur_preds is not None
+                    and prev_carry is not None
+                    and prev_preds.shape == cur_preds.shape
+                ):
+                    continuing = ~prev_carry.halted  # (B,) examples that were still active at previous step
+                    if continuing.any():
+                        inputs = carry.current_data["inputs"]   # (B, L)
+                        labels = carry.current_data["labels"]   # (B, L)
+
+                        blank_mask = (inputs == BLANK_TOKEN_ID)          # (B, L)
+                        cont_mask = continuing.unsqueeze(-1)             # (B, 1)
+
+                        prev_correct = cont_mask & blank_mask & (prev_preds == labels)
+                        cur_correct  = cont_mask & blank_mask & (cur_preds == labels)
+
+                        corrected = (~prev_correct) & cur_correct
+                        damaged   = prev_correct & (~cur_correct)
+
+                        corr_n = corrected.sum()
+                        dmg_n = damaged.sum()
+
+                        roll_corr += corr_n
+                        roll_dmg  += dmg_n
+                        roll_net  += (corr_n - dmg_n)
+
+                        # denom counts continuing examples (not cells)
+                        roll_denom += continuing.to(torch.float32).sum()
+
+                # update previous preds after computing transition stats
+                prev_preds = cur_preds
+
                 if all_finish:
                     break
 
             if rank == 0:
                 print(f"  Completed inference in {inference_steps} steps")
 
+            # ---------------------------------------------------------
+            # Inject rollout-averaged corrected/damaged into THIS batch metrics
+            # IMPORTANT: evaluate() later divides every metric by "count".
+            # So store (avg * count) so the final division yields avg.
+            # ---------------------------------------------------------
+            den = roll_denom.clamp_min(1.0)
+            corr_avg = roll_corr / den
+            dmg_avg  = roll_dmg  / den
+            net_avg  = roll_net  / den
+
+            # If you want to log "per halted-example average" (consistent with other metrics),
+            # use metrics["count"] as the reduction count.
+            count_for_reduction = metrics.get("count", torch.tensor(0.0, device="cuda")).clamp_min(1.0)
+
+            metrics["corrected_cells_rollout_avg"] = corr_avg * count_for_reduction
+            metrics["damaged_cells_rollout_avg"]   = dmg_avg  * count_for_reduction
+            metrics["net_cells_rollout_avg"]       = net_avg  * count_for_reduction
+
+            # ---------------------------------------------------------
+            # Save requested outputs (unchanged)
+            # ---------------------------------------------------------
             for collection in (batch, preds):
                 for k, v in collection.items():
                     if k in config.eval_save_outputs:
                         save_preds.setdefault(k, [])
                         save_preds[k].append(v.cpu())
 
+            # Evaluators (unchanged)
             for evaluator in evaluators:
                 evaluator.update_batch(batch, preds)
 
@@ -589,6 +673,9 @@ def evaluate(
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             del metrics
 
+        # ---------------------------------------------------------
+        # Save preds (unchanged)
+        # ---------------------------------------------------------
         save_preds = {k: torch.cat(v, dim=0) for k, v in save_preds.items()}
 
         if config.checkpoint_path is not None and len(save_preds):
@@ -600,6 +687,9 @@ def evaluate(
 
         del save_preds
 
+        # ---------------------------------------------------------
+        # Reduce metrics across GPUs (unchanged)
+        # ---------------------------------------------------------
         if metric_values is not None:
             if world_size > 1:
                 dist.reduce(metric_values, dst=0)
@@ -618,6 +708,9 @@ def evaluate(
                     count = m.pop("count")
                     reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
 
+        # ---------------------------------------------------------
+        # Evaluators final results (unchanged)
+        # ---------------------------------------------------------
         if rank == 0:
             print(f"\nRunning {len(evaluators)} evaluator(s)...")
 
@@ -644,6 +737,7 @@ def evaluate(
             print("All evaluators completed!")
 
     return reduced_metrics
+
 
 
 def save_code_and_config(config: PretrainConfig):
