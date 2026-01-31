@@ -87,6 +87,25 @@ class ACTLossHead(nn.Module):
             is_correct = mask & (preds == labels)            # (B,L)
             seq_is_correct = (is_correct.sum(-1) == loss_counts)  # (B,)
 
+            # Track per-cell correctness over time for retention metrics
+            prev_ever_correct = getattr(previous_carry, "ever_correct", None) if previous_carry is not None else None
+            if previous_carry is not None and prev_ever_correct is not None and prev_ever_correct.shape == mask.shape:
+                reset_mask = previous_carry.halted.unsqueeze(-1)  # (B,1) True => newly loaded
+                ever_correct = torch.where(reset_mask, torch.zeros_like(mask), prev_ever_correct)
+            else:
+                ever_correct = torch.zeros_like(mask)
+
+            ever_correct = ever_correct | is_correct
+
+            # retention rate: among cells that were ever correct, how many are correct at the final step
+            retained_cells = (ever_correct & is_correct).sum(-1).to(torch.float32)  # (B,)
+            ever_correct_cells = ever_correct.sum(-1).to(torch.float32)  # (B,)
+            retention_rate = torch.where(
+                ever_correct_cells > 0,
+                retained_cells / ever_correct_cells,
+                torch.zeros_like(ever_correct_cells),
+            )
+
             # Metrics (halted-only, same as your original behavior)
             valid_metrics = new_carry.halted
             metrics: Dict[str, torch.Tensor] = {
@@ -102,6 +121,7 @@ class ACTLossHead(nn.Module):
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "retention_rate": torch.where(valid_metrics, retention_rate, 0.0).sum(),
             }
 
             # ------------------------------------------------------------
@@ -160,6 +180,7 @@ class ACTLossHead(nn.Module):
 
             # Save preds for next step comparison
             new_carry.prev_preds = preds.detach()
+            new_carry.ever_correct = ever_correct.detach()
 
         # Losses (only blanks)
         lm_loss = (
