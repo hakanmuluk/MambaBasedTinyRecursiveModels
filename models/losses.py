@@ -97,12 +97,13 @@ class ACTLossHead(nn.Module):
 
             ever_correct = ever_correct | is_correct
 
-            # retention rate: cells that were ever correct and are correct at final step, normalized by blanks
+            # retention rate: among cells that were ever correct, how many are correct at the final step
             retained_cells = (ever_correct & is_correct).sum(-1).to(torch.float32)  # (B,)
+            ever_correct_cells = ever_correct.sum(-1).to(torch.float32)  # (B,)
             retention_rate = torch.where(
-                loss_counts > 0,
-                retained_cells / loss_counts.to(torch.float32),
-                torch.zeros_like(retained_cells),
+                ever_correct_cells > 0,
+                retained_cells / ever_correct_cells,
+                torch.zeros_like(ever_correct_cells),
             )
 
             # Metrics (halted-only, same as your original behavior)
