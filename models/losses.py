@@ -87,6 +87,24 @@ class ACTLossHead(nn.Module):
             is_correct = mask & (preds == labels)            # (B,L)
             seq_is_correct = (is_correct.sum(-1) == loss_counts)  # (B,)
 
+            # Track per-cell correctness over time for retention metrics
+            prev_ever_correct = getattr(previous_carry, "ever_correct", None) if previous_carry is not None else None
+            if previous_carry is not None and prev_ever_correct is not None and prev_ever_correct.shape == mask.shape:
+                reset_mask = previous_carry.halted.unsqueeze(-1)  # (B,1) True => newly loaded
+                ever_correct = torch.where(reset_mask, torch.zeros_like(mask), prev_ever_correct)
+            else:
+                ever_correct = torch.zeros_like(mask)
+
+            ever_correct = ever_correct | is_correct
+
+            # retention rate: cells that were ever correct and are correct at final step, normalized by blanks
+            retained_cells = (ever_correct & is_correct).sum(-1).to(torch.float32)  # (B,)
+            retention_rate = torch.where(
+                loss_counts > 0,
+                retained_cells / loss_counts.to(torch.float32),
+                torch.zeros_like(retained_cells),
+            )
+
             # Metrics (halted-only, same as your original behavior)
             valid_metrics = new_carry.halted
             metrics: Dict[str, torch.Tensor] = {
@@ -102,6 +120,7 @@ class ACTLossHead(nn.Module):
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "retention_rate": torch.where(valid_metrics, retention_rate, 0.0).sum(),
             }
 
             # ------------------------------------------------------------
@@ -119,18 +138,22 @@ class ACTLossHead(nn.Module):
 
                 corrected = (~prev_correct) & now_correct     # wrong -> correct on blanks
                 damaged = prev_correct & (~now_correct)       # correct -> wrong on blanks
+                flipped = mask & (prev_preds != preds)        # changed value on blanks
 
                 corrected_step = corrected.sum(-1).to(torch.float32)  # (B,)
                 damaged_step = damaged.sum(-1).to(torch.float32)      # (B,)
+                flipped_step = flipped.sum(-1).to(torch.float32)      # (B,)
 
                 corrected_sum = torch.where(continuing, corrected_step, 0.0).sum()
                 damaged_sum = torch.where(continuing, damaged_step, 0.0).sum()
                 net_sum = torch.where(continuing, corrected_step - damaged_step, 0.0).sum()
+                flipped_sum = torch.where(continuing, flipped_step, 0.0).sum()
 
                 metrics.update({
                     "corrected_cells_step": corrected_sum,
                     "damaged_cells_step": damaged_sum,
                     "net_cells_step": net_sum,
+                    "flipped_cells_step": flipped_sum,
                 })
 
                 # Optional: averages per continuing example (nice for W&B)
@@ -139,6 +162,7 @@ class ACTLossHead(nn.Module):
                     "corrected_cells_step_avg": corrected_sum / denom,
                     "damaged_cells_step_avg": damaged_sum / denom,
                     "net_cells_step_avg": net_sum / denom,
+                    "flipped_cells_step_avg": flipped_sum / denom,
                 })
             else:
                 z = torch.tensor(0.0, device=preds.device)
@@ -146,13 +170,16 @@ class ACTLossHead(nn.Module):
                     "corrected_cells_step": z,
                     "damaged_cells_step": z,
                     "net_cells_step": z,
+                    "flipped_cells_step": z,
                     "corrected_cells_step_avg": z,
                     "damaged_cells_step_avg": z,
                     "net_cells_step_avg": z,
+                    "flipped_cells_step_avg": z,
                 })
 
             # Save preds for next step comparison
             new_carry.prev_preds = preds.detach()
+            new_carry.ever_correct = ever_correct.detach()
 
         # Losses (only blanks)
         lm_loss = (
