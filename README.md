@@ -302,7 +302,7 @@ ema=True \
 
 
 
-run_name="bimamba_v2_dropout_less_bias_and_comb_fixed"
+run_name="bimamba_v2_dropout_final"
 
 python pretrain.py \
 arch=trm \
@@ -311,12 +311,12 @@ data_paths_test="[]" \
 evaluators="[]" \
 global_batch_size=320 \
 epochs=30000 \
-eval_interval=500 \
+eval_interval=1000 \
 lr=3e-5 \
 lr_mamba=3e-5 \
 lr_min_ratio=0.2 \
 lr_warmup_steps=2500 \
-weight_decay=0.075 \
+weight_decay=0.05 \
 puzzle_emb_lr=3e-5 \
 puzzle_emb_weight_decay=0.1 \
 arch.L_layers=2 \
