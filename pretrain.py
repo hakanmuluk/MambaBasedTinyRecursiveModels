@@ -573,6 +573,7 @@ def evaluate(
             roll_corr = torch.tensor(0.0, device="cuda")
             roll_dmg = torch.tensor(0.0, device="cuda")
             roll_net = torch.tensor(0.0, device="cuda")
+            roll_flip = torch.tensor(0.0, device="cuda")
             roll_denom = torch.tensor(0.0, device="cuda")  # #continuing examples summed across transitions
 
             prev_preds = None
@@ -611,13 +612,16 @@ def evaluate(
 
                         corrected = (~prev_correct) & cur_correct
                         damaged   = prev_correct & (~cur_correct)
+                        flipped   = cont_mask & blank_mask & (prev_preds != cur_preds)
 
                         corr_n = corrected.sum()
                         dmg_n = damaged.sum()
+                        flip_n = flipped.sum()
 
                         roll_corr += corr_n
                         roll_dmg  += dmg_n
                         roll_net  += (corr_n - dmg_n)
+                        roll_flip += flip_n
 
                         # denom counts continuing examples (not cells)
                         roll_denom += continuing.to(torch.float32).sum()
@@ -640,6 +644,7 @@ def evaluate(
             corr_avg = roll_corr / den
             dmg_avg  = roll_dmg  / den
             net_avg  = roll_net  / den
+            flip_avg = roll_flip / den
 
             # If you want to log "per halted-example average" (consistent with other metrics),
             # use metrics["count"] as the reduction count.
@@ -648,6 +653,7 @@ def evaluate(
             metrics["corrected_cells_rollout_avg"] = corr_avg * count_for_reduction
             metrics["damaged_cells_rollout_avg"]   = dmg_avg  * count_for_reduction
             metrics["net_cells_rollout_avg"]       = net_avg  * count_for_reduction
+            metrics["flipped_cells_rollout_avg"]   = flip_avg * count_for_reduction
 
             # ---------------------------------------------------------
             # Save requested outputs (unchanged)

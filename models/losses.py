@@ -119,18 +119,22 @@ class ACTLossHead(nn.Module):
 
                 corrected = (~prev_correct) & now_correct     # wrong -> correct on blanks
                 damaged = prev_correct & (~now_correct)       # correct -> wrong on blanks
+                flipped = mask & (prev_preds != preds)        # changed value on blanks
 
                 corrected_step = corrected.sum(-1).to(torch.float32)  # (B,)
                 damaged_step = damaged.sum(-1).to(torch.float32)      # (B,)
+                flipped_step = flipped.sum(-1).to(torch.float32)      # (B,)
 
                 corrected_sum = torch.where(continuing, corrected_step, 0.0).sum()
                 damaged_sum = torch.where(continuing, damaged_step, 0.0).sum()
                 net_sum = torch.where(continuing, corrected_step - damaged_step, 0.0).sum()
+                flipped_sum = torch.where(continuing, flipped_step, 0.0).sum()
 
                 metrics.update({
                     "corrected_cells_step": corrected_sum,
                     "damaged_cells_step": damaged_sum,
                     "net_cells_step": net_sum,
+                    "flipped_cells_step": flipped_sum,
                 })
 
                 # Optional: averages per continuing example (nice for W&B)
@@ -139,6 +143,7 @@ class ACTLossHead(nn.Module):
                     "corrected_cells_step_avg": corrected_sum / denom,
                     "damaged_cells_step_avg": damaged_sum / denom,
                     "net_cells_step_avg": net_sum / denom,
+                    "flipped_cells_step_avg": flipped_sum / denom,
                 })
             else:
                 z = torch.tensor(0.0, device=preds.device)
@@ -146,9 +151,11 @@ class ACTLossHead(nn.Module):
                     "corrected_cells_step": z,
                     "damaged_cells_step": z,
                     "net_cells_step": z,
+                    "flipped_cells_step": z,
                     "corrected_cells_step_avg": z,
                     "damaged_cells_step_avg": z,
                     "net_cells_step_avg": z,
+                    "flipped_cells_step_avg": z,
                 })
 
             # Save preds for next step comparison
