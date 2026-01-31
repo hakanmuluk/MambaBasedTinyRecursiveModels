@@ -336,21 +336,21 @@ ema=True \
 
 
 
-run_name="bimamba_v2_gating_input_masked_loss"
+run_name="bimamba_v2_input_masked_loss"
 python pretrain.py \
 arch=trm \
 data_paths="[data/sudoku-extreme-1k-aug-1000]" \
 data_paths_test="[]" \
 evaluators="[]" \
-global_batch_size=384 \
+global_batch_size=320 \
 epochs=30000 \
-eval_interval=3000 \
-lr=1e-4 \
-lr_mamba=1e-4 \
+eval_interval=375 \
+lr=3e-5 \
+lr_mamba=3e-5 \
 lr_min_ratio=0.2 \
 lr_warmup_steps=2500 \
 weight_decay=0.05 \
-puzzle_emb_lr=1e-4 \
+puzzle_emb_lr=3e-5 \
 puzzle_emb_weight_decay=0.05 \
 arch.L_layers=2 \
 arch.H_cycles=3 arch.L_cycles=6 \
