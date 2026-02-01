@@ -365,7 +365,7 @@ arch.bilstm_with_nn=False \
 ema=True \
 +run_name=${run_name}
 
-run_name="bimamba_v2_dropout_less"
+run_name="bimamba_v2_gating_final"
 python pretrain.py \
 arch=trm \
 data_paths="[data/sudoku-extreme-1k-aug-1000]" \
@@ -373,13 +373,13 @@ data_paths_test="[]" \
 evaluators="[]" \
 global_batch_size=320 \
 epochs=30000 \
-eval_interval=1500 \
-lr=1e-6 \
-lr_mamba=1e-6 \
+eval_interval=1000 \
+lr=3e-5 \
+lr_mamba=3e-5 \
 lr_min_ratio=0.2 \
 lr_warmup_steps=2500 \
 weight_decay=0.1 \
-puzzle_emb_lr=1e-6 \
+puzzle_emb_lr=3e-5 \
 puzzle_emb_weight_decay=0.1 \
 arch.L_layers=2 \
 arch.H_cycles=3 arch.L_cycles=6 \
@@ -392,6 +392,34 @@ arch.mamba_bimamba_with_transformer_and_nn=False \
 arch.mamba_two_stage=False \
 arch.bilstm_with_nn=False \
 arch.mamba_dropout_p=0.0 \
+ema=True \
++run_name=${run_name}
+
+
+
+run_name="state_dep_dual_mamba_dropout_final"
+
+python pretrain.py \
+arch=trm \
+data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+data_paths_test="[]" \
+evaluators="[]" \
+global_batch_size=96 \
+epochs=10000 \
+eval_interval=400 \
+lr=3e-5 \
+lr_mamba=3e-5 \
+lr_min_ratio=0.2 \
+lr_warmup_steps=2500 \
+weight_decay=0.05 \
+puzzle_emb_lr=3e-5 \
+puzzle_emb_weight_decay=0.1 \
+arch.L_layers=2 \
+arch.H_cycles=3 \
+arch.L_cycles=6 \
+arch.mamba_dropout_p=0.05 \
+arch.state_dep_dual_mamba=True \
+arch.mlp_t=False \
 ema=True \
 +run_name=${run_name}
 
